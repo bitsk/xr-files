@@ -1,0 +1,17 @@
+[Desktop Entry]
+Type=Application
+Name=XR Files
+Name[zh_CN]=空间文件
+GenericName=Spatial File Manager
+GenericName[zh_CN]=三维空间文件管理器
+Comment=Browse, search, preview and organize files in 3D space
+Comment[zh_CN]=在三维空间中浏览、极速搜索、全息预览与整理文件
+Exec=xr-files-desktop %f
+TryExec=xr-files-desktop
+Icon=system-file-manager
+Terminal=false
+X-XR-Immersive=true
+StartupWMClass=xr-files
+Categories=System;FileTools;FileManager;Utility;
+Keywords=OpenXR;VR;Files;Spatial;3D;Treemap;
+MimeType=inode/directory;

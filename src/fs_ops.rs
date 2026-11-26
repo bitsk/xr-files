@@ -95,19 +95,19 @@ impl FileKind {
         }
     }
 
-    /// Linear RGBA accent tint used on 3D volumetric cards and 3D treemap blocks.
+    /// Linear RGBA accent tint harmonized with UKUI XR Qingkong (`ukui.spatial.qingkong.light`).
     pub fn accent_rgba(self) -> [f32; 4] {
         match self {
-            Self::Directory => [0.22, 0.58, 0.98, 1.0],
-            Self::Image => [0.18, 0.80, 0.64, 1.0],
-            Self::Video => [0.94, 0.36, 0.52, 1.0],
-            Self::Audio => [0.95, 0.62, 0.20, 1.0],
-            Self::Model3D => [0.64, 0.42, 0.98, 1.0],
-            Self::Code => [0.24, 0.76, 0.92, 1.0],
-            Self::Document => [0.46, 0.66, 0.96, 1.0],
-            Self::Archive => [0.88, 0.68, 0.26, 1.0],
-            Self::Executable => [0.34, 0.86, 0.48, 1.0],
-            Self::Other => [0.54, 0.62, 0.74, 1.0],
+            Self::Directory => [1.00, 0.58, 0.04, 1.0],  // UKUI Folder Gold (#FFC735 in linear)
+            Self::Image => [0.05, 0.52, 0.96, 1.0],      // Sky Cyan (#2AB8FF)
+            Self::Video => [0.34, 0.18, 0.95, 1.0],      // Media Violet (#8B6BFF)
+            Self::Audio => [0.95, 0.34, 0.42, 1.0],      // Coral Rose
+            Self::Model3D => [0.18, 0.32, 0.96, 1.0],    // Royal Iris (#4B7BFF)
+            Self::Code => [0.08, 0.45, 0.68, 1.0],       // Teal Slate
+            Self::Document => [0.98, 0.26, 0.04, 1.0],   // UKUI Doc Orange (#FF7A1A)
+            Self::Archive => [0.92, 0.44, 0.05, 1.0],    // Warm Amber
+            Self::Executable => [0.12, 0.62, 0.34, 1.0], // Emerald
+            Self::Other => [0.32, 0.44, 0.62, 1.0],      // Periwinkle Slate
         }
     }
 }

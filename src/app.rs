@@ -1,20 +1,22 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Spatial File Manager Application State Machine, Dual-View Scene Builder,
-//! 6DoF Dual-Hand Ray Routing, Double-Click Stabilizer, and Spatial Drag-and-Drop.
+//! Spatial File Manager Application State Machine & UKUI XR "Qingkong" (`ukui.spatial.qingkong.light`)
+//! Spatial Window + Floating Hologram Inspector + Companion Grab Bar Scene Builder.
 
 use crate::{
     fs_ops::{
         self, Bookmark, ClipboardOp, FileClipboard, FileEntry, FileKind, SortBy, StorageVolume,
         UndoRecord, TRASH_URI,
     },
+    icons::{icon_slot_for_kind, BUILTIN_ICON_COUNT},
     preview::{AsyncPreviewer, MeshVertex, MipmappedRgba},
+    renderer::THUMB_LAYERS,
     simd::{self, SoaAabbBatch},
     spatial::{
         arc_panel_pose, center_eye_position, quat_forward, quat_from_yaw_pitch, quat_mul,
         quat_rotate_vec3, user_facing_orientation, vec3_add, vec3_dot, vec3_len, vec3_normalize,
         vec3_scale, vec3_sub, EyeView, Pose3D,
     },
-    text::GlyphAtlas,
+    text::{FontWeight, GlyphAtlas},
     treemap3d::{self, TreemapBlock},
 };
 use anyhow::Result;
@@ -28,9 +30,81 @@ use std::{
 
 pub const CARDS_PER_PAGE: usize = 12; // 4 cols × 3 rows
 const GRID_COLS: usize = 4;
-const GRID_ROWS: usize = 3;
-/// 2.2° minimum angular hit slop (`Constraint 2.3`).
-const HIT_SLOP_RAD: f32 = 0.0384; // 2.2 deg in radians
+const HIT_SLOP_RAD: f32 = 0.0384; // 2.2° minimum angular target rule
+
+// ============================================================================
+// Exact UKUI XR "Qingkong" (`ukui.spatial.qingkong.light`) Colorimetric Tokens
+// ============================================================================
+
+#[inline]
+fn srgb_chan_to_linear(u: u8) -> f32 {
+    let c = (u as f32) / 255.0;
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+#[inline]
+fn qk_rgba(r: u8, g: u8, b: u8, a: f32) -> [f32; 4] {
+    [
+        srgb_chan_to_linear(r),
+        srgb_chan_to_linear(g),
+        srgb_chan_to_linear(b),
+        a,
+    ]
+}
+
+// Official tokens from `xr-spatial-kit/styles/ukui.json` & `style-reference.png`:
+fn col_glass_panel() -> [f32; 4] {
+    qk_rgba(232, 240, 248, 0.76) // #E8F0F8 Frosted Silver Mist Glass
+}
+fn col_content_well() -> [f32; 4] {
+    qk_rgba(245, 247, 250, 0.88) // #F5F7FA Warm Clear Content Surface
+}
+fn col_card_idle() -> [f32; 4] {
+    qk_rgba(255, 255, 255, 0.90) // Crisp Floating File Card
+}
+fn col_card_hover() -> [f32; 4] {
+    qk_rgba(255, 255, 255, 0.98)
+}
+fn col_card_selected() -> [f32; 4] {
+    qk_rgba(226, 240, 255, 0.96) // Soft Kylin Azure Tint
+}
+fn col_pill_idle() -> [f32; 4] {
+    qk_rgba(245, 247, 250, 0.86) // #F5F7FA Button / Pill
+}
+fn col_pill_hover() -> [f32; 4] {
+    qk_rgba(255, 255, 255, 0.98)
+}
+fn col_kylin_blue() -> [f32; 4] {
+    qk_rgba(55, 144, 250, 0.98) // #3790FA Kylin Focus Blue
+}
+fn col_kylin_blue_hover() -> [f32; 4] {
+    qk_rgba(78, 158, 255, 1.0)
+}
+fn col_ink_navy() -> [f32; 4] {
+    qk_rgba(35, 48, 71, 1.0) // #233047 Primary Ink Navy Text
+}
+fn col_muted_slate() -> [f32; 4] {
+    qk_rgba(87, 108, 139, 1.0) // #576C8B Secondary Muted Caption
+}
+fn col_pure_white() -> [f32; 4] {
+    [1.0, 1.0, 1.0, 1.0]
+}
+fn col_rim_light() -> [f32; 4] {
+    [1.0, 1.0, 1.0, 0.72] // Luminous Specular Glass Edge
+}
+fn col_rim_subtle() -> [f32; 4] {
+    [1.0, 1.0, 1.0, 0.50]
+}
+fn col_danger_soft() -> [f32; 4] {
+    qk_rgba(252, 236, 238, 0.92)
+}
+fn col_danger_text() -> [f32; 4] {
+    qk_rgba(218, 58, 74, 1.0)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -67,7 +141,7 @@ impl CategoryFilter {
             Self::Folders => "文件夹",
             Self::Media => "媒体",
             Self::DocsCode => "文档代码",
-            Self::Models3D => "3D资产",
+            Self::Models3D => "3D 资产",
         }
     }
 }
@@ -101,10 +175,6 @@ pub enum HapticEvent {
     GrabStart,
 }
 
-// ============================================================================
-// Renderable Scene Primitives Output per Frame
-// ============================================================================
-
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, Pod, Zeroable)]
 pub struct SolidVertex {
@@ -123,7 +193,7 @@ pub struct QuadInstance {
     pub uv_rect: [f32; 4],
     pub fill_color: [f32; 4],
     pub border_color: [f32; 4],
-    /// `[corner_radius_m, border_width_m, tex_kind (0=sdf, 1=glyph, 2=thumb, 3=inspect), tex_layer]`
+    /// `[corner_radius_m, border_or_spread_m, tex_kind (0=glass, 1=glyph, 2=thumb/icon, 3=inspect, 4=shadow), tex_layer]`
     pub params: [f32; 4],
 }
 
@@ -159,6 +229,7 @@ enum HitAction {
     InspectorTrashOrRestore,
     UndoLast,
     RecenterWorkspace,
+    GrabWorkspaceBar,
     ContextAction(ContextMenuOp),
 }
 
@@ -201,7 +272,7 @@ struct WorkspaceGrab {
     hand: usize,
     start_ray_dir: [f32; 3],
     base_yaw: f32,
-    base_radius: f32,
+    via_trigger: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -227,7 +298,6 @@ pub struct SpatialFilesApp {
     back_stack: Vec<String>,
     forward_stack: Vec<String>,
     pub all_entries: Vec<FileEntry>,
-    /// Indices into `all_entries` after SIMD search & category filtering.
     pub filtered_indices: Vec<usize>,
     pub selected_entry_indices: HashSet<usize>,
     pub primary_selected: Option<usize>,
@@ -250,13 +320,11 @@ pub struct SpatialFilesApp {
 
     pub previewer: AsyncPreviewer,
     pub thumb_slot_by_path: HashMap<PathBuf, u32>,
-    next_thumb_slot: u32,
-    pub max_thumb_slots: u32,
+    next_photo_slot: u32,
     pub pending_gpu_thumbs: Vec<(u32, MipmappedRgba)>,
     pub pending_gpu_inspect_image: Option<MipmappedRgba>,
     last_uploaded_inspect_path: Option<PathBuf>,
 
-    // Spatial workspace anchor & ergonomic bounds
     pub anchor_pos: [f32; 3],
     pub anchor_yaw: f32,
     pub workspace_radius: f32,
@@ -266,7 +334,6 @@ pub struct SpatialFilesApp {
     shutdown_flag: bool,
     pub submitted_frames: u64,
 
-    // Per-visible-slot SIMD smoothed Z-offset (meters) & hover glow
     slot_z_cur: Vec<f32>,
     slot_z_tgt: Vec<f32>,
     treemap_lift_cur: Vec<f32>,
@@ -274,7 +341,6 @@ pub struct SpatialFilesApp {
     cached_treemap: Vec<TreemapBlock>,
     treemap_dirty: bool,
 
-    // Interaction & ray hitboxes rebuilt each frame
     hit_batch: SoaAabbBatch,
     hit_actions: Vec<HitAction>,
     hovered_hit: [Option<usize>; 2],
@@ -328,17 +394,16 @@ impl SpatialFilesApp {
             volumes: fs_ops::discover_volumes(),
             clipboard: None,
             undo_stack: Vec::new(),
-            status_message: format!("空间文件已就绪 · SIMD 后端: {}", simd::active_simd_backend()),
+            status_message: String::new(),
             previewer: AsyncPreviewer::new(),
             thumb_slot_by_path: HashMap::new(),
-            next_thumb_slot: 0,
-            max_thumb_slots: 64,
+            next_photo_slot: 0,
             pending_gpu_thumbs: Vec::new(),
             pending_gpu_inspect_image: None,
             last_uploaded_inspect_path: None,
             anchor_pos: [0.0, 1.60, 0.0],
             anchor_yaw: 0.0,
-            workspace_radius: 1.48,
+            workspace_radius: 1.26,
             card_scale: 1.0,
             anchor_initialized: false,
             recenter_requested: false,
@@ -455,11 +520,7 @@ impl SpatialFilesApp {
                 if let Some(&first_idx) = self.filtered_indices.first() {
                     self.select_single(first_idx);
                 }
-                self.status_message = format!(
-                    "{} · {} 项",
-                    self.display_location_title(),
-                    self.filtered_indices.len()
-                );
+                self.status_message = format!("共 {} 项", self.filtered_indices.len());
             }
             Err(err) => {
                 self.status_message = format!("读取失败: {err}");
@@ -508,19 +569,6 @@ impl SpatialFilesApp {
         self.previewer.request_inspect(&self.all_entries[entry_idx]);
     }
 
-    pub fn toggle_select(&mut self, entry_idx: usize) {
-        if entry_idx >= self.all_entries.len() {
-            return;
-        }
-        if !self.selected_entry_indices.remove(&entry_idx) {
-            self.selected_entry_indices.insert(entry_idx);
-            self.primary_selected = Some(entry_idx);
-            self.previewer.request_inspect(&self.all_entries[entry_idx]);
-        } else {
-            self.primary_selected = self.selected_entry_indices.iter().next().copied();
-        }
-    }
-
     pub fn set_search_query(&mut self, query: String) {
         self.search_query = query;
         self.page = 0;
@@ -538,7 +586,7 @@ impl SpatialFilesApp {
         self.undo_stack.push(undo);
         self.reload_directory();
         self.select_by_path(&created);
-        self.status_message = format!("已新建文件夹：{}", name.trim());
+        self.status_message = format!("已新建：{}", name.trim());
         Ok(created)
     }
 
@@ -558,14 +606,13 @@ impl SpatialFilesApp {
     pub fn copy_selected_to_clipboard(&mut self, op: ClipboardOp) {
         let paths = self.selected_paths();
         if paths.is_empty() {
-            self.status_message = "未选择任何文件".into();
             return;
         }
         let n = paths.len();
         self.clipboard = Some(FileClipboard { op, paths });
         self.status_message = match op {
-            ClipboardOp::Copy => format!("已复制 {n} 项到空间剪贴板"),
-            ClipboardOp::Cut => format!("已剪切 {n} 项，前往目标目录点「粘贴」移动"),
+            ClipboardOp::Copy => format!("已复制 {n} 项"),
+            ClipboardOp::Cut => format!("已剪切 {n} 项"),
         };
     }
 
@@ -604,16 +651,16 @@ impl SpatialFilesApp {
                 count += 1;
             }
             self.reload_directory();
-            self.status_message = format!("已从回收站还原 {count} 项");
+            self.status_message = format!("已还原 {count} 项");
             return Ok(());
         }
         let paths = self.selected_paths();
-        anyhow::ensure!(!paths.is_empty(), "请先选择要移入回收站的项目");
+        anyhow::ensure!(!paths.is_empty(), "请先选择项目");
         let n = paths.len();
         let undo = fs_ops::trash_paths(&paths)?;
         self.undo_stack.push(undo);
         self.reload_directory();
-        self.status_message = format!("已移入回收站 {n} 项（可点击「撤销」恢复）");
+        self.status_message = format!("已移入回收站 {n} 项");
         Ok(())
     }
 
@@ -683,9 +730,7 @@ impl SpatialFilesApp {
         };
         let text = self.prompt_buffer.trim().to_string();
         match mode {
-            PromptMode::Search => {
-                self.set_search_query(text);
-            }
+            PromptMode::Search => self.set_search_query(text),
             PromptMode::NewFolder => {
                 let name = if text.is_empty() { "新建文件夹" } else { &text };
                 if let Err(e) = self.create_folder_named(name) {
@@ -740,21 +785,13 @@ impl SpatialFilesApp {
         }
     }
 
-    fn display_location_title(&self) -> String {
-        if self.current_location == TRASH_URI {
-            return "回收站 (trash://)".into();
-        }
-        if self.current_location == "/" {
-            return "/".into();
-        }
-        Path::new(&self.current_location)
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| self.current_location.clone())
+    pub fn step_page(&mut self, delta: isize) {
+        let total = self.page_count() as isize;
+        self.page = (self.page as isize + delta).clamp(0, (total - 1).max(0)) as usize;
     }
 
     // ========================================================================
-    // Per-Frame Simulation, SIMD Hit-Testing, Controller Input & Scene Build
+    // Per-Frame Simulation, SIMD Hit-Testing & UKUI Qingkong Scene Builder
     // ========================================================================
 
     pub fn step_and_build_scene(
@@ -779,11 +816,12 @@ impl SpatialFilesApp {
             self.recenter_requested = false;
         }
 
-        // Poll non-blocking thumbnails and inspector results
+        // Poll async thumbnails into slots `BUILTIN_ICON_COUNT..THUMB_LAYERS`
+        let photo_cap = (THUMB_LAYERS - BUILTIN_ICON_COUNT).max(1);
         for (path, mips) in self.previewer.poll() {
             let slot = *self.thumb_slot_by_path.entry(path).or_insert_with(|| {
-                let s = self.next_thumb_slot % self.max_thumb_slots.max(1);
-                self.next_thumb_slot = self.next_thumb_slot.wrapping_add(1);
+                let s = BUILTIN_ICON_COUNT + (self.next_photo_slot % photo_cap);
+                self.next_photo_slot = self.next_photo_slot.wrapping_add(1);
                 s
             });
             self.pending_gpu_thumbs.push((slot, mips));
@@ -797,7 +835,6 @@ impl SpatialFilesApp {
             }
         }
 
-        // Request thumbnails for visible page entries
         let page_start = self.page * CARDS_PER_PAGE;
         let page_end = (page_start + CARDS_PER_PAGE).min(self.filtered_indices.len());
         for pos in page_start..page_end {
@@ -805,10 +842,9 @@ impl SpatialFilesApp {
             self.previewer.request_thumbnail(&self.all_entries[entry_idx]);
         }
 
-        // Process inputs against previous frame's hitboxes (1-frame stable or immediate rebuild)
         self.process_controller_inputs(hands, now, dt);
 
-        // Smooth Z-travel (`+8mm` rest, `+18mm` hover, `+2mm` press) via SIMD lerp!
+        // SIMD spring smoothing for spatial Z-lift (`+8mm` rest, `+18mm` hover, `+2mm` press)
         let spring_alpha = (1.0 - (-18.0 * dt).exp()).clamp(0.05, 1.0);
         simd::lerp_f32_slice_in_place(&mut self.slot_z_cur, &self.slot_z_tgt, spring_alpha);
         simd::lerp_f32_slice_in_place(
@@ -817,30 +853,24 @@ impl SpatialFilesApp {
             spring_alpha,
         );
 
-        // Rebuild scene & SIMD SoA hitboxes for current pose
         let mut scene = FrameScene::default();
         self.hit_batch.clear();
         self.hit_actions.clear();
 
-        self.emit_environment_reference(&mut scene);
-        self.emit_top_command_bar(&mut scene, eye_center, glyphs);
-        self.emit_left_navigation_wing(&mut scene, eye_center, glyphs);
-        match self.view_mode {
-            ViewMode::Workbench => {
-                self.emit_depth_breadcrumbs(&mut scene, eye_center, glyphs);
-                self.emit_center_workbench_cards(&mut scene, eye_center, hands, glyphs);
-            }
-            ViewMode::Treemap3D => {
-                self.emit_center_treemap_3d(&mut scene, eye_center, glyphs);
-            }
-        }
-        self.emit_right_inspector_wing(&mut scene, eye_center, glyphs);
+        // Slightly shift main spatial window left (`+6.5°` yaw) when Inspector is visible on right (`-26.5°`)
+        // so the full ensemble sits symmetrically balanced in the user's comfortable horizon FOV!
+        let main_yaw_deg = 9.2;
+        let insp_yaw_deg = -30.5;
+
+        self.emit_depth_breadcrumbs(&mut scene, main_yaw_deg, eye_center, glyphs);
+        self.emit_main_qingkong_window(&mut scene, main_yaw_deg, eye_center, hands, glyphs);
+        self.emit_companion_window_bar(&mut scene, main_yaw_deg, eye_center, glyphs);
+        self.emit_right_inspector_card(&mut scene, insp_yaw_deg, eye_center, glyphs);
         if self.context_menu.is_some() {
             self.emit_context_menu(&mut scene, eye_center, glyphs);
         }
         self.hit_batch.finalize_padding();
 
-        // Update hovered targets & draw 6DoF controllers + rays + normal-aligned reticles + drag ghost
         self.update_hover_and_emit_hands(&mut scene, eye_center, hands, glyphs);
 
         scene
@@ -881,12 +911,11 @@ impl SpatialFilesApp {
                 self.cancel_modals();
             }
             if ctrl.thumb_click_just_pressed {
-                self.workspace_radius = 1.48;
+                self.workspace_radius = 1.26;
                 self.card_scale = 1.0;
                 self.request_recenter();
             }
 
-            // Secondary button (A / X or right-click) opens spatial context menu
             if ctrl.secondary_just_pressed {
                 let entry_idx = pick
                     .and_then(|p| self.hit_actions.get(p.index))
@@ -898,7 +927,7 @@ impl SpatialFilesApp {
                     self.select_single(idx);
                 }
                 let anchor_world = pick.map(|p| p.hit_point).unwrap_or_else(|| {
-                    vec3_add(ctrl.aim_origin, vec3_scale(ctrl.aim_dir, 1.55))
+                    vec3_add(ctrl.aim_origin, vec3_scale(ctrl.aim_dir, 1.38))
                 });
                 self.context_menu = Some(ContextMenuState {
                     anchor_world,
@@ -907,8 +936,6 @@ impl SpatialFilesApp {
                 self.pending_haptics[h] = Some(HapticEvent::ContextMenu);
             }
 
-            // Squeeze (Grip): either grab a hovered file card for 3D drag-and-drop,
-            // or grab the workspace horizon arc to rotate & push/pull depth (`Constraint 2.1`)!
             if sqz_just_down {
                 if let Some(p) = pick {
                     if let Some(&HitAction::SelectEntry(idx)) = self.hit_actions.get(p.index) {
@@ -935,7 +962,7 @@ impl SpatialFilesApp {
                             hand: h,
                             start_ray_dir: ctrl.aim_dir,
                             base_yaw: self.anchor_yaw,
-                            base_radius: self.workspace_radius,
+                            via_trigger: false,
                         });
                         self.pending_haptics[h] = Some(HapticEvent::GrabStart);
                     }
@@ -944,26 +971,34 @@ impl SpatialFilesApp {
                         hand: h,
                         start_ray_dir: ctrl.aim_dir,
                         base_yaw: self.anchor_yaw,
-                        base_radius: self.workspace_radius,
+                        via_trigger: false,
                     });
                     self.pending_haptics[h] = Some(HapticEvent::GrabStart);
                 }
             }
 
             if let Some(ref grab) = self.workspace_grab {
-                if grab.hand == h && ctrl.squeeze_pressed {
+                let held = if grab.via_trigger {
+                    ctrl.trigger_pressed
+                } else {
+                    ctrl.squeeze_pressed
+                };
+                if grab.hand == h && held {
                     let yaw0 = (-grab.start_ray_dir[0]).atan2(-grab.start_ray_dir[2]);
                     let yaw1 = (-ctrl.aim_dir[0]).atan2(-ctrl.aim_dir[2]);
                     self.anchor_yaw = grab.base_yaw + (yaw1 - yaw0);
                     if ctrl.stick[1].abs() > 0.18 {
                         self.workspace_radius =
-                            (self.workspace_radius - ctrl.stick[1] * 1.15 * dt).clamp(1.05, 3.20);
+                            (self.workspace_radius - ctrl.stick[1] * 1.15 * dt).clamp(1.05, 3.00);
                     }
-                    let _ = grab.base_radius;
                 }
             }
             if sqz_just_up {
-                if self.workspace_grab.as_ref().is_some_and(|g| g.hand == h) {
+                if self
+                    .workspace_grab
+                    .as_ref()
+                    .is_some_and(|g| g.hand == h && !g.via_trigger)
+                {
                     self.workspace_grab = None;
                 }
                 if self.drag_session.as_ref().is_some_and(|d| d.hand == h) {
@@ -971,7 +1006,6 @@ impl SpatialFilesApp {
                 }
             }
 
-            // Thumbstick pagination when not grabbing workspace
             if self.workspace_grab.is_none() && now >= self.stick_cooldown_until[h] {
                 let sy = ctrl.stick[1];
                 let sx = ctrl.stick[0];
@@ -984,7 +1018,6 @@ impl SpatialFilesApp {
                 }
             }
 
-            // Primary Trigger: click, spatial double-click stabilizer, or threshold drag-and-drop
             if trig_just_down {
                 if let Some(p) = pick {
                     if let Some(action) = self.hit_actions.get(p.index).cloned() {
@@ -998,15 +1031,22 @@ impl SpatialFilesApp {
                 if let Some(ref mut drag) = self.drag_session {
                     if drag.hand == h && !drag.active_drag {
                         let cur_pt = pick.map(|p| p.hit_point).unwrap_or_else(|| {
-                            vec3_add(ctrl.aim_origin, vec3_scale(ctrl.aim_dir, 1.65))
+                            vec3_add(ctrl.aim_origin, vec3_scale(ctrl.aim_dir, 1.40))
                         });
-                        if vec3_len(vec3_sub(cur_pt, drag.start_point)) > 0.045 {
+                        if vec3_len(vec3_sub(cur_pt, drag.start_point)) > 0.042 {
                             drag.active_drag = true;
                             self.pending_haptics[h] = Some(HapticEvent::GrabStart);
                         }
                     }
                 }
             } else if trig_just_up {
+                if self
+                    .workspace_grab
+                    .as_ref()
+                    .is_some_and(|g| g.hand == h && g.via_trigger)
+                {
+                    self.workspace_grab = None;
+                }
                 if self.drag_session.as_ref().is_some_and(|d| d.hand == h) {
                     self.finish_drag_drop(pick.map(|p| p.index));
                 }
@@ -1023,9 +1063,16 @@ impl SpatialFilesApp {
         now: Instant,
     ) {
         match action {
+            HitAction::GrabWorkspaceBar => {
+                self.workspace_grab = Some(WorkspaceGrab {
+                    hand,
+                    start_ray_dir: ray_dir,
+                    base_yaw: self.anchor_yaw,
+                    via_trigger: true,
+                });
+            }
             HitAction::SelectEntry(entry_idx) => {
                 self.context_menu = None;
-                // Spatial Double-Click Stabilizer (`40ms..440ms`, ray angle `<= 1.6°` -> open!)
                 let is_double = self.last_click[hand].as_ref().is_some_and(|prev| {
                     let dt = now.duration_since(prev.at);
                     let cos_ang = vec3_dot(prev.ray_dir, ray_dir).clamp(-1.0, 1.0);
@@ -1101,7 +1148,7 @@ impl SpatialFilesApp {
                 self.prompt_mode = Some(mode);
                 self.prompt_buffer = match mode {
                     PromptMode::Search => self.search_query.clone(),
-                    PromptMode::NewFolder => "新建空间目录".into(),
+                    PromptMode::NewFolder => "新建文件夹".into(),
                     PromptMode::Rename => self
                         .primary_selected
                         .and_then(|i| self.all_entries.get(i))
@@ -1117,9 +1164,7 @@ impl SpatialFilesApp {
             HitAction::PromptAppend(s) => self.handle_key_text(s),
             HitAction::PromptBackspace => self.handle_backspace(),
             HitAction::PromptCommit => self.commit_prompt(),
-            HitAction::PromptCancel => {
-                self.prompt_mode = None;
-            }
+            HitAction::PromptCancel => self.prompt_mode = None,
             HitAction::InspectorOpen { cinema } => self.open_selected(cinema),
             HitAction::InspectorCopy => self.copy_selected_to_clipboard(ClipboardOp::Copy),
             HitAction::InspectorCut => self.copy_selected_to_clipboard(ClipboardOp::Cut),
@@ -1178,54 +1223,34 @@ impl SpatialFilesApp {
             return;
         };
         let target_result = match action {
-            HitAction::SelectEntry(idx) => {
-                if let Some(entry) = self.all_entries.get(idx) {
-                    if entry.kind == FileKind::Directory {
-                        Some(entry.path.to_string_lossy().into_owned())
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            }
+            HitAction::SelectEntry(idx) => self
+                .all_entries
+                .get(idx)
+                .filter(|e| e.kind == FileKind::Directory)
+                .map(|e| e.path.to_string_lossy().into_owned()),
             HitAction::NavigateLocation(loc) => Some(loc),
             _ => None,
         };
         if let Some(dest) = target_result {
             if dest == TRASH_URI {
-                match fs_ops::trash_paths(&drag.source_paths) {
-                    Ok(undo) => {
-                        let n = drag.source_paths.len();
-                        self.undo_stack.push(undo);
-                        self.reload_directory();
-                        self.status_message = format!("空间拖拽：已将 {n} 项移入回收站");
-                    }
-                    Err(e) => self.status_message = format!("拖入回收站失败: {e}"),
+                if let Ok(undo) = fs_ops::trash_paths(&drag.source_paths) {
+                    let n = drag.source_paths.len();
+                    self.undo_stack.push(undo);
+                    self.reload_directory();
+                    self.status_message = format!("已将 {n} 项移入回收站");
                 }
-            } else {
-                let dest_path = PathBuf::from(&dest);
-                match fs_ops::move_paths_to_dir(&drag.source_paths, &dest_path) {
-                    Ok(undo) => {
-                        let summary = undo.summary();
-                        self.undo_stack.push(undo);
-                        self.reload_directory();
-                        self.status_message =
-                            format!("空间拖拽完成：{summary} -> {}", dest_path.display());
-                    }
-                    Err(e) => self.status_message = format!("空间拖拽移动失败: {e}"),
-                }
+            } else if let Ok(undo) = fs_ops::move_paths_to_dir(&drag.source_paths, Path::new(&dest))
+            {
+                let summary = undo.summary();
+                self.undo_stack.push(undo);
+                self.reload_directory();
+                self.status_message = format!("已移动：{summary}");
             }
         }
     }
 
-    pub fn step_page(&mut self, delta: isize) {
-        let total = self.page_count() as isize;
-        self.page = (self.page as isize + delta).clamp(0, (total - 1).max(0)) as usize;
-    }
-
     // ========================================================================
-    // Spatial Geometry Emission Helpers
+    // UKUI XR "Qingkong" Spatial Window, Cards, 3D Treemap & Companion Bar
     // ========================================================================
 
     fn register_hit(&mut self, center: [f32; 3], half_ext: [f32; 3], action: HitAction) -> usize {
@@ -1248,179 +1273,357 @@ impl SpatialFilesApp {
         self.hovered_hit[0] == Some(hit_index) || self.hovered_hit[1] == Some(hit_index)
     }
 
-    fn emit_environment_reference(&self, scene: &mut FrameScene) {
-        // Calm circular spatial horizon reference rings below floor (`y = anchor_pos.y - 1.55m`)
-        // to give stable peripheral orientation reference during head turns (`Constraint 6 / P1-7`).
-        let floor_y = self.anchor_pos[1] - 1.52;
-        for ring in [1.45f32, 2.35, 3.40] {
-            let segs = 48usize;
-            for i in 0..segs {
-                let a0 = (i as f32 / segs as f32) * std::f32::consts::TAU;
-                let a1 = ((i + 1) as f32 / segs as f32) * std::f32::consts::TAU;
-                let p0 = [
-                    self.anchor_pos[0] + a0.cos() * ring,
-                    floor_y,
-                    self.anchor_pos[2] + a0.sin() * ring,
-                ];
-                let p1 = [
-                    self.anchor_pos[0] + a1.cos() * ring,
-                    floor_y,
-                    self.anchor_pos[2] + a1.sin() * ring,
-                ];
-                push_beam_segment(
-                    &mut scene.solid_vertices,
-                    p0,
-                    p1,
-                    0.0025,
-                    0.0025,
-                    [0.14, 0.28, 0.48, 0.42],
-                    0.15,
-                );
-            }
-        }
-    }
-
-    fn emit_top_command_bar(
+    fn emit_depth_breadcrumbs(
         &mut self,
         scene: &mut FrameScene,
+        yaw_deg: f32,
         eye_center: [f32; 3],
         glyphs: &mut GlyphAtlas,
     ) {
-        // Top Command Bar at Pitch ~ +6.5° (elevation +0.20m at R=1.72m), well within [-25°, +10°]
-        let panel = arc_panel_pose(
-            self.anchor_pos,
-            self.anchor_yaw,
-            0.0,
-            0.29,
-            self.workspace_radius - 0.02,
-            eye_center,
-        );
-        let pw = 1.24;
-        let ph = 0.13;
-        push_panel_glass(
-            &mut scene.quads,
-            &panel,
-            [0.0, 0.0, 0.0],
-            [pw, ph],
-            0.022,
-            [0.055, 0.085, 0.145, 0.84],
-            [0.36, 0.62, 0.96, 0.34],
-        );
-
-        // Navigation buttons: Back, Forward, Up
-        let navs = [
-            ("←", -0.555, HitAction::NavigateBack),
-            ("→", -0.495, HitAction::NavigateForward),
-            ("↑上级", -0.415, HitAction::NavigateUp),
-        ];
-        for (label, lx, act) in navs {
-            let bw = if label.len() > 3 { 0.082 } else { 0.048 };
-            self.emit_panel_button(
-                scene,
-                &panel,
-                [lx, 0.028, 0.010],
-                [bw, 0.044],
-                label,
-                act,
-                false,
+        if self.current_location == TRASH_URI {
+            return;
+        }
+        let mut ancestors: Vec<PathBuf> = Vec::new();
+        let mut cur = Path::new(&self.current_location).parent();
+        while let Some(p) = cur {
+            ancestors.push(p.to_path_buf());
+            if ancestors.len() >= 2 {
+                break;
+            }
+            cur = p.parent();
+        }
+        // Draw furthest ancestor first so nearer glass layers blend cleanly in front
+        for (depth_idx, anc) in ancestors.into_iter().enumerate().rev() {
+            let z_push = (depth_idx + 1) as f32 * 0.11;
+            let y_lift = 0.375 + depth_idx as f32 * 0.036;
+            let pose = arc_panel_pose(
+                self.anchor_pos,
+                self.anchor_yaw,
+                yaw_deg,
+                y_lift,
+                self.workspace_radius + z_push,
+                eye_center,
+            );
+            let title = if anc == Path::new("/") {
+                "上层空间  ›  系统根目录 /".to_string()
+            } else {
+                format!(
+                    "上层空间  ›  {}",
+                    anc.file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| anc.display().to_string())
+                )
+            };
+            let alpha = if depth_idx == 0 { 0.62 } else { 0.42 };
+            push_panel_glass(
+                &mut scene.quads,
+                &pose,
+                [0.0, 0.0, 0.0],
+                [0.86, 0.046],
+                0.022,
+                qk_rgba(236, 243, 252, alpha),
+                [1.0, 1.0, 1.0, alpha * 0.85],
+            );
+            push_panel_text(
+                &mut scene.quads,
+                &pose,
+                [-0.39, -0.008, 0.004],
+                &title,
+                0.017,
+                0.78,
+                qk_rgba(55, 76, 108, alpha + 0.25),
+                FontWeight::Regular,
                 glyphs,
             );
+            self.register_hit(
+                pose.position,
+                [0.43, 0.024, 0.02],
+                HitAction::NavigateLocation(anc.to_string_lossy().into_owned()),
+            );
         }
+    }
 
-        // Breadcrumb / Active Prompt Display
-        let path_display = if let Some(mode) = self.prompt_mode {
-            let tag = match mode {
-                PromptMode::Search => "SIMD 搜索",
+    fn emit_main_qingkong_window(
+        &mut self,
+        scene: &mut FrameScene,
+        yaw_deg: f32,
+        eye_center: [f32; 3],
+        hands: &[HandControllerInput; 2],
+        glyphs: &mut GlyphAtlas,
+    ) {
+        let win = arc_panel_pose(
+            self.anchor_pos,
+            self.anchor_yaw,
+            yaw_deg,
+            -0.02,
+            self.workspace_radius,
+            eye_center,
+        );
+        let win_w = 1.28f32;
+        let win_h = 0.74f32;
+
+        // 1. Exterior-only soft Qingkong drop shadow (`xr-shell` material==4 style)
+        push_panel_shadow(
+            &mut scene.quads,
+            &win,
+            [0.0, -0.010, -0.012],
+            [win_w, win_h],
+            0.032,
+            0.036,
+            0.085,
+        );
+
+        // 2. Main Frosted Silver-Mist Glass Window (`#E8F0F8`)
+        push_panel_glass(
+            &mut scene.quads,
+            &win,
+            [0.0, 0.0, 0.0],
+            [win_w, win_h],
+            0.032,
+            col_glass_panel(),
+            col_rim_light(),
+        );
+
+        // 3. Header Bar (`个人文件` + Golden Folder emblem + Search/Breadcrumb Pill + Segmented View Switcher)
+        push_textured_quad(
+            &mut scene.quads,
+            &win,
+            [-0.585, 0.318, 0.005],
+            [0.040, 0.040],
+            0.010,
+            2,
+            0.0, // Golden Folder icon
+        );
+        push_panel_text(
+            &mut scene.quads,
+            &win,
+            [-0.552, 0.310, 0.006],
+            "个人文件",
+            0.024,
+            0.16,
+            col_ink_navy(),
+            FontWeight::Bold,
+            glyphs,
+        );
+
+        // Breadcrumb / Search Pill
+        let search_text = if let Some(mode) = self.prompt_mode {
+            let prefix = match mode {
+                PromptMode::Search => "搜索",
                 PromptMode::NewFolder => "新建文件夹",
                 PromptMode::Rename => "重命名",
             };
-            format!("{tag}: {}▌", self.prompt_buffer)
+            format!("{prefix}:  {}▌", self.prompt_buffer)
         } else if !self.search_query.is_empty() {
             format!(
-                "{}  [筛选: {}]",
+                "{}   ·  筛选: {}",
                 self.current_location, self.search_query
             )
         } else {
             self.current_location.clone()
         };
         let search_active = self.prompt_mode.is_some() || !self.search_query.is_empty();
-        self.emit_panel_button(
+        self.emit_qingkong_pill(
             scene,
-            &panel,
-            [-0.055, 0.028, 0.010],
-            [0.58, 0.044],
-            &path_display,
+            &win,
+            [-0.145, 0.318, 0.006],
+            [0.52, 0.042],
+            &search_text,
             HitAction::StartPrompt(PromptMode::Search),
             search_active,
+            false,
             glyphs,
         );
 
-        // Top-right quick actions: Search Clear / New Folder / Paste / Undo / Recenter
-        self.emit_panel_button(
+        // Segmented View Mode Toggle (`工作台` | `3D 星图`)
+        self.emit_qingkong_pill(
             scene,
-            &panel,
-            [0.295, 0.028, 0.010],
-            [0.095, 0.044],
-            "+新建夹",
+            &win,
+            [0.195, 0.318, 0.006],
+            [0.105, 0.040],
+            "工作台",
+            HitAction::ToggleView(ViewMode::Workbench),
+            self.view_mode == ViewMode::Workbench,
+            false,
+            glyphs,
+        );
+        self.emit_qingkong_pill(
+            scene,
+            &win,
+            [0.308, 0.318, 0.006],
+            [0.105, 0.040],
+            "3D 星图",
+            HitAction::ToggleView(ViewMode::Treemap3D),
+            self.view_mode == ViewMode::Treemap3D,
+            false,
+            glyphs,
+        );
+
+        // Quick Header Actions (`+ 新建` / `粘贴` / `撤销`)
+        self.emit_qingkong_pill(
+            scene,
+            &win,
+            [0.428, 0.318, 0.006],
+            [0.088, 0.040],
+            "+ 新建",
             HitAction::StartPrompt(PromptMode::NewFolder),
             false,
+            false,
             glyphs,
         );
-        let has_clip = self.clipboard.is_some();
-        self.emit_panel_button(
+        self.emit_qingkong_pill(
             scene,
-            &panel,
-            [0.400, 0.028, 0.010],
-            [0.082, 0.044],
+            &win,
+            [0.518, 0.318, 0.006],
+            [0.072, 0.040],
             "粘贴",
             HitAction::PasteHere,
-            has_clip,
+            self.clipboard.is_some(),
+            false,
             glyphs,
         );
-        let has_undo = !self.undo_stack.is_empty();
-        self.emit_panel_button(
+        self.emit_qingkong_pill(
             scene,
-            &panel,
-            [0.492, 0.028, 0.010],
-            [0.082, 0.044],
+            &win,
+            [0.594, 0.318, 0.006],
+            [0.072, 0.040],
             "撤销",
             HitAction::UndoLast,
-            has_undo,
-            glyphs,
-        );
-        self.emit_panel_button(
-            scene,
-            &panel,
-            [0.575, 0.028, 0.010],
-            [0.062, 0.044],
-            "归中",
-            HitAction::RecenterWorkspace,
+            !self.undo_stack.is_empty(),
             false,
             glyphs,
         );
 
-        // Bottom row of Command Bar: Category Filter Chips OR Prompt Quick-Input Bar
+        // 4. Left Embedded Qingkong Sidebar (`x in -0.62..-0.36`, matching `style-reference.png` 04!)
+        let bookmarks = self.bookmarks.clone();
+        for (i, bm) in bookmarks.iter().take(7).enumerate() {
+            let ly = 0.228 - (i as f32) * 0.052;
+            let active = self.current_location == bm.target;
+            self.emit_qingkong_pill(
+                scene,
+                &win,
+                [-0.492, ly, 0.006],
+                [0.235, 0.042],
+                &bm.label,
+                HitAction::NavigateLocation(bm.target.clone()),
+                active,
+                false,
+                glyphs,
+            );
+        }
+
+        // Sort & Order & Hidden toggles in Sidebar
+        let arrow = if self.ascending { "↑" } else { "↓" };
+        self.emit_qingkong_pill(
+            scene,
+            &win,
+            [-0.556, -0.155, 0.006],
+            [0.108, 0.038],
+            self.sort_by.label_zh(),
+            HitAction::CycleSort,
+            false,
+            false,
+            glyphs,
+        );
+        self.emit_qingkong_pill(
+            scene,
+            &win,
+            [-0.478, -0.155, 0.006],
+            [0.038, 0.038],
+            arrow,
+            HitAction::ToggleSortOrder,
+            false,
+            false,
+            glyphs,
+        );
+        self.emit_qingkong_pill(
+            scene,
+            &win,
+            [-0.415, -0.155, 0.006],
+            [0.072, 0.038],
+            "隐藏项",
+            HitAction::ToggleHidden,
+            self.show_hidden,
+            false,
+            glyphs,
+        );
+
+        // Storage Volume Kylin-Blue Progress Gauge at Sidebar Bottom
+        if let Some(vol) = self.volumes.first().cloned() {
+            let used = vol.total_bytes.saturating_sub(vol.free_bytes);
+            let ratio = (used as f32 / vol.total_bytes.max(1) as f32).clamp(0.05, 1.0);
+            let cap_label = format!("存储剩余 {}", fs_ops::format_bytes(vol.free_bytes));
+            push_panel_text(
+                &mut scene.quads,
+                &win,
+                [-0.602, -0.235, 0.006],
+                &cap_label,
+                0.0155,
+                0.22,
+                col_muted_slate(),
+                FontWeight::Regular,
+                glyphs,
+            );
+            // Track
+            push_panel_glass(
+                &mut scene.quads,
+                &win,
+                [-0.492, -0.268, 0.006],
+                [0.225, 0.010],
+                0.005,
+                qk_rgba(205, 218, 236, 0.85),
+                [0.0; 4],
+            );
+            // Active Kylin-Blue Fill (`#3790FA`)
+            let fill_w = 0.225 * ratio;
+            push_panel_glass(
+                &mut scene.quads,
+                &win,
+                [-0.6045 + 0.5 * fill_w, -0.268, 0.008],
+                [fill_w, 0.010],
+                0.005,
+                col_kylin_blue(),
+                [0.0; 4],
+            );
+        }
+
+        // 5. Right Warm-White Content Surface Well (`#F5F7FA`, `x in -0.35..+0.62`)
+        let well_cx = 0.135f32;
+        let well_cy = -0.028f32;
+        let well_w = 0.965f32;
+        let well_h = 0.625f32;
+        push_panel_glass(
+            &mut scene.quads,
+            &win,
+            [well_cx, well_cy, 0.003],
+            [well_w, well_h],
+            0.024,
+            col_content_well(),
+            col_rim_subtle(),
+        );
+
+        // Top Filter Bar inside Content Well (or Prompt Quick Tokens)
         if self.prompt_mode.is_some() {
             let tokens: &[(&str, HitAction)] = &[
                 ("doc", HitAction::PromptAppend("doc")),
                 ("xr", HitAction::PromptAppend("xr")),
                 (".rs", HitAction::PromptAppend(".rs")),
                 (".mp4", HitAction::PromptAppend(".mp4")),
-                ("_2", HitAction::PromptAppend("_2")),
                 ("退格", HitAction::PromptBackspace),
                 ("确认", HitAction::PromptCommit),
                 ("取消", HitAction::PromptCancel),
             ];
             for (i, (lbl, act)) in tokens.iter().enumerate() {
-                let lx = -0.49 + (i as f32) * 0.138;
-                self.emit_panel_button(
+                let lx = -0.28 + (i as f32) * 0.122;
+                self.emit_qingkong_pill(
                     scene,
-                    &panel,
-                    [lx, -0.032, 0.010],
-                    [0.122, 0.038],
+                    &win,
+                    [lx, 0.244, 0.008],
+                    [0.108, 0.036],
                     lbl,
                     act.clone(),
                     *lbl == "确认",
+                    false,
                     glyphs,
                 );
             }
@@ -1433,309 +1636,81 @@ impl SpatialFilesApp {
                 CategoryFilter::Models3D,
             ];
             for (i, f) in filters.into_iter().enumerate() {
-                let lx = -0.50 + (i as f32) * 0.135;
-                self.emit_panel_button(
+                let lx = -0.275 + (i as f32) * 0.118;
+                self.emit_qingkong_pill(
                     scene,
-                    &panel,
-                    [lx, -0.032, 0.010],
-                    [0.122, 0.036],
+                    &win,
+                    [lx, 0.244, 0.008],
+                    [0.106, 0.035],
                     f.label_zh(),
                     HitAction::SetFilter(f),
                     self.category_filter == f,
+                    false,
                     glyphs,
                 );
             }
             if !self.search_query.is_empty() {
-                self.emit_panel_button(
+                self.emit_qingkong_pill(
                     scene,
-                    &panel,
-                    [0.19, -0.032, 0.010],
-                    [0.105, 0.036],
-                    "清除搜索",
+                    &win,
+                    [0.335, 0.244, 0.008],
+                    [0.098, 0.035],
+                    "清除筛选",
                     HitAction::ClearSearch,
                     true,
+                    false,
                     glyphs,
                 );
             }
-            // Live status message readout
             push_panel_text(
                 &mut scene.quads,
-                &panel,
-                [0.27, -0.038, 0.012],
+                &win,
+                [0.445, 0.237, 0.008],
                 &self.status_message,
-                0.017,
-                0.33,
-                [0.72, 0.86, 1.0, 0.94],
-                glyphs,
-            );
-        }
-    }
-
-    fn emit_left_navigation_wing(
-        &mut self,
-        scene: &mut FrameScene,
-        eye_center: [f32; 3],
-        glyphs: &mut GlyphAtlas,
-    ) {
-        // Left Wing at +34.5° arc yaw (>3° angular gap from Center Stage!)
-        let panel = arc_panel_pose(
-            self.anchor_pos,
-            self.anchor_yaw,
-            34.5,
-            -0.06,
-            self.workspace_radius,
-            eye_center,
-        );
-        let pw = 0.42;
-        let ph = 0.66;
-        push_panel_glass(
-            &mut scene.quads,
-            &panel,
-            [0.0, 0.0, 0.0],
-            [pw, ph],
-            0.024,
-            [0.05, 0.08, 0.14, 0.84],
-            [0.32, 0.58, 0.94, 0.30],
-        );
-
-        push_panel_text(
-            &mut scene.quads,
-            &panel,
-            [-0.18, 0.285, 0.008],
-            "空间导航与视图",
-            0.021,
-            0.36,
-            [0.90, 0.95, 1.0, 1.0],
-            glyphs,
-        );
-
-        // Dual Spatial View Switcher
-        self.emit_panel_button(
-            scene,
-            &panel,
-            [-0.095, 0.235, 0.010],
-            [0.175, 0.042],
-            "弧面工作台",
-            HitAction::ToggleView(ViewMode::Workbench),
-            self.view_mode == ViewMode::Workbench,
-            glyphs,
-        );
-        self.emit_panel_button(
-            scene,
-            &panel,
-            [0.095, 0.235, 0.010],
-            [0.175, 0.042],
-            "3D 体积星图",
-            HitAction::ToggleView(ViewMode::Treemap3D),
-            self.view_mode == ViewMode::Treemap3D,
-            glyphs,
-        );
-
-        // Sort & Hidden controls
-        let order_arrow = if self.ascending { "↑" } else { "↓" };
-        self.emit_panel_button(
-            scene,
-            &panel,
-            [-0.095, 0.182, 0.010],
-            [0.175, 0.038],
-            &format!("{}{order_arrow}", self.sort_by.label_zh()),
-            HitAction::CycleSort,
-            false,
-            glyphs,
-        );
-        self.emit_panel_button(
-            scene,
-            &panel,
-            [0.042, 0.182, 0.010],
-            [0.075, 0.038],
-            order_arrow,
-            HitAction::ToggleSortOrder,
-            false,
-            glyphs,
-        );
-        self.emit_panel_button(
-            scene,
-            &panel,
-            [0.135, 0.182, 0.010],
-            [0.095, 0.038],
-            ".隐藏",
-            HitAction::ToggleHidden,
-            self.show_hidden,
-            glyphs,
-        );
-
-        // Bookmarks (also act as spatial drag-and-drop targets!)
-        let bookmarks = self.bookmarks.clone();
-        for (i, bm) in bookmarks.iter().take(6).enumerate() {
-            let ly = 0.118 - (i as f32) * 0.048;
-            let active = self.current_location == bm.target;
-            let label = format!("[{}] {}", bm.icon_tag, bm.label);
-            self.emit_panel_button(
-                scene,
-                &panel,
-                [0.0, ly, 0.010],
-                [0.365, 0.040],
-                &label,
-                HitAction::NavigateLocation(bm.target.clone()),
-                active,
+                0.0155,
+                0.16,
+                col_muted_slate(),
+                FontWeight::Regular,
                 glyphs,
             );
         }
 
-        // Storage Volumes with capacity bar
-        push_panel_text(
-            &mut scene.quads,
-            &panel,
-            [-0.18, -0.185, 0.008],
-            "存储卷容量",
-            0.018,
-            0.34,
-            [0.68, 0.80, 0.96, 0.92],
-            glyphs,
-        );
-        let vols = self.volumes.clone();
-        for (i, vol) in vols.iter().take(2).enumerate() {
-            let ly = -0.232 - (i as f32) * 0.058;
-            let used = vol.total_bytes.saturating_sub(vol.free_bytes);
-            let ratio = (used as f32 / vol.total_bytes.max(1) as f32).clamp(0.02, 1.0);
-            let label = format!(
-                "{} · 剩余 {}",
-                vol.name,
-                fs_ops::format_bytes(vol.free_bytes)
-            );
-            self.emit_panel_button(
-                scene,
-                &panel,
-                [0.0, ly, 0.010],
-                [0.365, 0.044],
-                &label,
-                HitAction::NavigateLocation(vol.mount_point.to_string_lossy().into_owned()),
-                self.current_location == vol.mount_point.to_string_lossy(),
-                glyphs,
-            );
-            // Capacity gauge bar
-            let bar_w = 0.34 * ratio;
-            push_panel_glass(
-                &mut scene.quads,
-                &panel,
-                [-0.17 + 0.5 * bar_w, ly - 0.017, 0.015],
-                [bar_w, 0.005],
-                0.002,
-                [0.24, 0.72, 0.98, 0.95],
-                [0.0, 0.0, 0.0, 0.0],
-            );
-        }
-    }
-
-    fn emit_depth_breadcrumbs(
-        &mut self,
-        scene: &mut FrameScene,
-        eye_center: [f32; 3],
-        glyphs: &mut GlyphAtlas,
-    ) {
-        if self.current_location == TRASH_URI {
-            return;
-        }
-        // Receding Z-depth parent cards above/behind the active grid for true spatial hierarchy
-        let mut ancestors: Vec<PathBuf> = Vec::new();
-        let mut cur = Path::new(&self.current_location).parent();
-        while let Some(p) = cur {
-            ancestors.push(p.to_path_buf());
-            if ancestors.len() >= 2 {
-                break;
+        match self.view_mode {
+            ViewMode::Workbench => {
+                self.emit_qingkong_file_grid(scene, &win, well_cx, hands, glyphs);
             }
-            cur = p.parent();
-        }
-        for (depth_idx, anc) in ancestors.into_iter().enumerate() {
-            let z_push = (depth_idx + 1) as f32 * 0.14;
-            let y_lift = 0.185 + depth_idx as f32 * 0.032;
-            let pose = arc_panel_pose(
-                self.anchor_pos,
-                self.anchor_yaw,
-                0.0,
-                y_lift,
-                self.workspace_radius + z_push,
-                eye_center,
-            );
-            let title = if anc == Path::new("/") {
-                "上层根空间 /".to_string()
-            } else {
-                format!(
-                    "上层空间: {}",
-                    anc.file_name()
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| anc.display().to_string())
-                )
-            };
-            let fade = if depth_idx == 0 { 0.56 } else { 0.36 };
-            push_panel_glass(
-                &mut scene.quads,
-                &pose,
-                [0.0, 0.0, 0.0],
-                [0.64, 0.042],
-                0.014,
-                [0.07, 0.12, 0.22, fade],
-                [0.35, 0.65, 0.98, fade * 0.6],
-            );
-            push_panel_text(
-                &mut scene.quads,
-                &pose,
-                [-0.29, -0.007, 0.004],
-                &title,
-                0.017,
-                0.58,
-                [0.78, 0.90, 1.0, fade + 0.25],
-                glyphs,
-            );
-            self.register_hit(
-                pose.position,
-                [0.32, 0.022, 0.02],
-                HitAction::NavigateLocation(anc.to_string_lossy().into_owned()),
-            );
+            ViewMode::Treemap3D => {
+                self.emit_qingkong_treemap_3d(scene, &win, well_cx, eye_center, glyphs);
+            }
         }
     }
 
-    fn emit_center_workbench_cards(
+    fn emit_qingkong_file_grid(
         &mut self,
         scene: &mut FrameScene,
-        eye_center: [f32; 3],
+        win: &Pose3D,
+        well_cx: f32,
         hands: &[HandControllerInput; 2],
         glyphs: &mut GlyphAtlas,
     ) {
         let start = self.page * CARDS_PER_PAGE;
         let end = (start + CARDS_PER_PAGE).min(self.filtered_indices.len());
-        let scale = self.card_scale.clamp(0.75, 1.40);
-        let card_w = 0.245 * scale;
-        let card_h = 0.155 * scale;
+        let card_w = 0.214f32;
+        let card_h = 0.158f32;
 
         if self.filtered_indices.is_empty() {
-            let empty_pose = arc_panel_pose(
-                self.anchor_pos,
-                self.anchor_yaw,
-                0.0,
-                -0.06,
-                self.workspace_radius,
-                eye_center,
-            );
-            push_panel_glass(
-                &mut scene.quads,
-                &empty_pose,
-                [0.0, 0.0, 0.0],
-                [0.68, 0.16],
-                0.024,
-                [0.06, 0.09, 0.16, 0.78],
-                [0.32, 0.55, 0.88, 0.28],
-            );
             push_panel_text(
                 &mut scene.quads,
-                &empty_pose,
-                [-0.24, 0.005, 0.008],
-                "当前目录或筛选条件为空",
-                0.024,
-                0.52,
-                [0.84, 0.92, 1.0, 0.95],
+                win,
+                [well_cx - 0.14, -0.03, 0.012],
+                "当前文件夹为空或无匹配结果",
+                0.021,
+                0.42,
+                col_muted_slate(),
+                FontWeight::Regular,
                 glyphs,
             );
+            return;
         }
 
         for slot in 0..(end.saturating_sub(start)) {
@@ -1744,218 +1719,144 @@ impl SpatialFilesApp {
             let col = slot % GRID_COLS;
             let row = slot / GRID_COLS;
 
-            // Place each card along a smooth cylindrical arc with >= 2.2° gap between cards
-            let col_yaw_deg = (1.5 - col as f32) * 11.2;
-            let row_y = 0.095 - (row as f32) * 0.182;
-            let z_lift = self.slot_z_cur.get(slot).copied().unwrap_or(0.008);
+            let lx = well_cx + (col as f32 - 1.5) * 0.232;
+            let ly = 0.118 - (row as f32) * 0.176;
+            let z_lift = self.slot_z_cur.get(slot).copied().unwrap_or(0.010);
 
-            let card_pose = arc_panel_pose(
-                self.anchor_pos,
-                self.anchor_yaw,
-                col_yaw_deg,
-                row_y,
-                self.workspace_radius - z_lift,
-                eye_center,
+            let card_world = vec3_add(
+                win.position,
+                quat_rotate_vec3(win.orientation, [lx, ly, 0.006 + z_lift]),
             );
-
             let hit_idx = self.register_hit(
-                card_pose.position,
-                [card_w * 0.50, card_h * 0.50, 0.025],
+                card_world,
+                [card_w * 0.50, card_h * 0.50, 0.022],
                 HitAction::SelectEntry(entry_idx),
             );
             let hovered = self.is_hit_hovered(hit_idx);
-            let any_pressed = hovered && (hands[0].trigger_pressed || hands[1].trigger_pressed);
-            // Constraint 2.4: +8mm rest, +18mm hover, +2mm press!
+            let pressed = hovered && (hands[0].trigger_pressed || hands[1].trigger_pressed);
             if slot < self.slot_z_tgt.len() {
-                self.slot_z_tgt[slot] = if any_pressed {
-                    0.002
+                // Constraint 2.4: 3D Z-travel (+10mm rest, +22mm hover, +3mm press)
+                self.slot_z_tgt[slot] = if pressed {
+                    0.003
                 } else if hovered {
-                    0.018
+                    0.022
                 } else {
-                    0.008
+                    0.010
                 };
             }
 
             let selected = self.selected_entry_indices.contains(&entry_idx);
-            let accent = entry.kind.accent_rgba();
+            let cz = 0.006 + z_lift;
 
-            // 3D volumetric card back-slab for genuine binocular edge thickness
-            push_oriented_box(
-                &mut scene.solid_vertices,
-                &card_pose,
-                [0.0, 0.0, -0.008],
-                [card_w * 0.485, card_h * 0.485, 0.006],
-                if selected {
-                    [accent[0] * 0.45, accent[1] * 0.45, accent[2] * 0.55, 1.0]
-                } else {
-                    [0.045, 0.070, 0.125, 1.0]
-                },
-                if hovered || selected { 0.25 } else { 0.04 },
+            // Delicate exterior card shadow so lifted cards cast depth onto `#F5F7FA` content well
+            push_panel_shadow(
+                &mut scene.quads,
+                win,
+                [lx, ly - 0.004, 0.005],
+                [card_w, card_h],
+                0.020,
+                0.018,
+                if hovered { 0.09 } else { 0.045 },
             );
 
             let fill = if selected {
-                [0.10, 0.20, 0.36, 0.90]
+                col_card_selected()
             } else if hovered {
-                [0.09, 0.15, 0.26, 0.88]
+                col_card_hover()
             } else {
-                [0.055, 0.090, 0.155, 0.84]
+                col_card_idle()
             };
             let border = if selected {
-                [accent[0], accent[1], accent[2], 0.95]
+                col_kylin_blue()
             } else if hovered {
-                [0.52, 0.80, 1.0, 0.72]
+                [1.0, 1.0, 1.0, 0.95]
             } else {
-                [0.28, 0.46, 0.74, 0.26]
+                qk_rgba(214, 226, 242, 0.65)
             };
+
             push_panel_glass(
                 &mut scene.quads,
-                &card_pose,
-                [0.0, 0.0, 0.0],
+                win,
+                [lx, ly, cz],
                 [card_w, card_h],
-                0.018,
+                0.020,
                 fill,
                 border,
             );
 
-            // Top color-coded badge or SIMD mipmapped image thumbnail
-            if let Some(&thumb_layer) = self.thumb_slot_by_path.get(&entry.path) {
+            // Visual Icon / Photo Preview
+            if let Some(&photo_layer) = self.thumb_slot_by_path.get(&entry.path) {
                 push_textured_quad(
                     &mut scene.quads,
-                    &card_pose,
-                    [0.0, 0.022, 0.004],
-                    [card_w - 0.024, card_h * 0.52],
-                    0.010,
+                    win,
+                    [lx, ly + 0.024, cz + 0.003],
+                    [card_w - 0.022, 0.086],
+                    0.014,
                     2,
-                    thumb_layer as f32,
+                    photo_layer as f32,
                 );
             } else {
-                // Volumetric 3D emblem block + badge tag
-                push_oriented_box(
-                    &mut scene.solid_vertices,
-                    &card_pose,
-                    [-card_w * 0.31, 0.030, 0.007],
-                    [0.024, 0.020, 0.006],
-                    accent,
-                    if entry.kind == FileKind::Directory {
-                        0.32
-                    } else {
-                        0.18
-                    },
-                );
-                push_panel_text(
+                let icon_slot = icon_slot_for_kind(entry.kind) as f32;
+                push_textured_quad(
                     &mut scene.quads,
-                    &card_pose,
-                    [-card_w * 0.16, 0.022, 0.006],
-                    entry.kind.label_zh(),
-                    0.016,
-                    card_w * 0.60,
-                    [accent[0].max(0.45), accent[1].max(0.65), accent[2].max(0.75), 0.95],
-                    glyphs,
+                    win,
+                    [lx, ly + 0.026, cz + 0.003],
+                    [0.074, 0.074],
+                    0.014,
+                    2,
+                    icon_slot,
                 );
             }
 
-            // Filename (Angular typography >= 20 dmm -> ~0.020m at 1.7m)
+            // Crisp Ink-Navy `#233047` Filename + Muted `#576C8B` Metadata
             push_panel_text(
                 &mut scene.quads,
-                &card_pose,
-                [-card_w * 0.43, -0.028, 0.006],
+                win,
+                [lx - card_w * 0.42, ly - 0.036, cz + 0.004],
                 &entry.name,
-                0.020,
-                card_w * 0.86,
-                [0.95, 0.97, 1.0, 1.0],
+                0.0175,
+                card_w * 0.84,
+                col_ink_navy(),
+                FontWeight::Bold,
                 glyphs,
             );
-
-            // Size + Date subtitle
             let sub = if entry.kind == FileKind::Directory {
-                format!("目录 · {}", fs_ops::format_timestamp_ymd_hm(entry.modified_unix))
+                "文件夹".to_string()
             } else {
-                format!(
-                    "{} · {}",
-                    fs_ops::format_bytes(entry.size),
-                    fs_ops::format_timestamp_ymd_hm(entry.modified_unix)
-                )
+                format!("{} · {}", entry.kind.label_zh(), fs_ops::format_bytes(entry.size))
             };
             push_panel_text(
                 &mut scene.quads,
-                &card_pose,
-                [-card_w * 0.43, -0.056, 0.006],
+                win,
+                [lx - card_w * 0.42, ly - 0.059, cz + 0.004],
                 &sub,
-                0.0145,
-                card_w * 0.86,
-                [0.64, 0.76, 0.92, 0.88],
+                0.0135,
+                card_w * 0.84,
+                col_muted_slate(),
+                FontWeight::Regular,
                 glyphs,
             );
         }
-
-        // Bottom Pagination Capsule
-        let pager_pose = arc_panel_pose(
-            self.anchor_pos,
-            self.anchor_yaw,
-            0.0,
-            -0.37,
-            self.workspace_radius - 0.02,
-            eye_center,
-        );
-        push_panel_glass(
-            &mut scene.quads,
-            &pager_pose,
-            [0.0, 0.0, 0.0],
-            [0.46, 0.056],
-            0.024,
-            [0.05, 0.08, 0.15, 0.86],
-            [0.34, 0.60, 0.94, 0.30],
-        );
-        self.emit_panel_button(
-            scene,
-            &pager_pose,
-            [-0.155, 0.0, 0.008],
-            [0.105, 0.038],
-            "◀ 上一页",
-            HitAction::PageDelta(-1),
-            false,
-            glyphs,
-        );
-        let page_str = format!("第 {} / {} 页", self.page + 1, self.page_count());
-        push_panel_text(
-            &mut scene.quads,
-            &pager_pose,
-            [-0.068, -0.007, 0.008],
-            &page_str,
-            0.017,
-            0.16,
-            [0.86, 0.93, 1.0, 0.95],
-            glyphs,
-        );
-        self.emit_panel_button(
-            scene,
-            &pager_pose,
-            [0.155, 0.0, 0.008],
-            [0.105, 0.038],
-            "下一页 ▶",
-            HitAction::PageDelta(1),
-            false,
-            glyphs,
-        );
-        let _ = GRID_ROWS;
     }
 
-    fn emit_center_treemap_3d(
+    fn emit_qingkong_treemap_3d(
         &mut self,
         scene: &mut FrameScene,
+        win: &Pose3D,
+        well_cx: f32,
         eye_center: [f32; 3],
         glyphs: &mut GlyphAtlas,
     ) {
-        let podium_w = 1.02f32;
-        let podium_d = 0.62f32;
+        let podium_w = 0.86f32;
+        let podium_d = 0.46f32;
         if self.treemap_dirty {
             let visible_entries: Vec<FileEntry> = self
                 .filtered_indices
                 .iter()
                 .filter_map(|&i| self.all_entries.get(i).cloned())
                 .collect();
-            let mut blocks = treemap3d::build_spatial_treemap(&visible_entries, podium_w, podium_d, 40);
-            // Remap block entry_index from `visible_entries` index to `all_entries` index
+            let mut blocks =
+                treemap3d::build_spatial_treemap(&visible_entries, podium_w, podium_d, 36);
             for b in &mut blocks {
                 b.entry_index = self.filtered_indices[b.entry_index];
             }
@@ -1963,52 +1864,45 @@ impl SpatialFilesApp {
             self.treemap_dirty = false;
         }
 
-        // Angled 3D Podium tilted 22° toward the viewer for effortless stereo overview
-        let (sy, cy) = self.anchor_yaw.sin_cos();
-        let dist = self.workspace_radius - 0.14;
-        let podium_center = [
-            self.anchor_pos[0] - sy * dist,
-            self.anchor_pos[1] - 0.24,
-            self.anchor_pos[2] - cy * dist,
-        ];
+        // Angled frosted-pearl 3D tray projecting gracefully out in front of the content well
+        let tray_center = vec3_add(
+            win.position,
+            quat_rotate_vec3(win.orientation, [well_cx, -0.075, 0.16]),
+        );
         let podium_pose = Pose3D {
-            position: podium_center,
+            position: tray_center,
             orientation: quat_mul(
-                quat_from_yaw_pitch(self.anchor_yaw, 0.0),
-                quat_from_yaw_pitch(0.0, 22.0f32.to_radians()),
+                win.orientation,
+                quat_from_yaw_pitch(0.0, 28.0f32.to_radians()),
             ),
         };
 
-        // Podium base slab
+        // Pearl-white 3D podium base slab
         push_oriented_box(
             &mut scene.solid_vertices,
             &podium_pose,
-            [0.0, -0.016, 0.0],
-            [podium_w * 0.52, 0.014, podium_d * 0.53],
-            [0.05, 0.085, 0.15, 1.0],
-            0.08,
+            [0.0, -0.012, 0.0],
+            [podium_w * 0.52, 0.011, podium_d * 0.53],
+            qk_rgba(232, 240, 250, 1.0),
+            0.05,
         );
 
         let blocks = self.cached_treemap.clone();
         for (bi, block) in blocks.iter().enumerate() {
             let entry = self.all_entries[block.entry_index].clone();
             let lift = self.treemap_lift_cur.get(bi).copied().unwrap_or(0.0);
-            let local_center = [block.x_center, 0.5 * block.height + lift, block.z_center];
+            let h_scaled = block.height * 0.82;
+            let local_center = [block.x_center, 0.5 * h_scaled + lift, block.z_center];
             let world_center = vec3_add(
                 podium_pose.position,
                 quat_rotate_vec3(podium_pose.orientation, local_center),
             );
-            let half_ext = [
-                0.5 * block.width,
-                0.5 * block.height + 0.01,
-                0.5 * block.depth,
-            ];
             let hit_idx = self.register_hit(
                 world_center,
                 [
-                    half_ext[0].max(0.025),
-                    half_ext[1].max(0.025),
-                    half_ext[2].max(0.025),
+                    (0.5 * block.width).max(0.022),
+                    (0.5 * h_scaled + 0.01).max(0.022),
+                    (0.5 * block.depth).max(0.022),
                 ],
                 HitAction::SelectEntry(block.entry_index),
             );
@@ -2016,9 +1910,9 @@ impl SpatialFilesApp {
             let selected = self.selected_entry_indices.contains(&block.entry_index);
             if bi < self.treemap_lift_tgt.len() {
                 self.treemap_lift_tgt[bi] = if hovered {
-                    0.022
+                    0.020
                 } else if selected {
-                    0.010
+                    0.008
                 } else {
                     0.0
                 };
@@ -2029,32 +1923,35 @@ impl SpatialFilesApp {
                 &mut scene.solid_vertices,
                 &podium_pose,
                 local_center,
-                [0.5 * block.width, 0.5 * block.height, 0.5 * block.depth],
+                [0.5 * block.width, 0.5 * h_scaled, 0.5 * block.depth],
                 accent,
                 if hovered {
-                    0.55
-                } else if selected {
                     0.35
+                } else if selected {
+                    0.18
                 } else {
-                    0.10
+                    0.04
                 },
             );
 
-            // Floating callout elevated clearly above all podium blocks and pulled toward eye
             if hovered || self.primary_selected == Some(block.entry_index) {
-                let raw_pos = [
-                    world_center[0],
-                    world_center[1] + 0.5 * block.height + 0.165,
-                    world_center[2],
+                let clamped_local = [
+                    block.x_center.clamp(-0.20, 0.16),
+                    0.5 * h_scaled + 0.115,
+                    block.z_center,
                 ];
+                let raw_pos = vec3_add(
+                    podium_pose.position,
+                    quat_rotate_vec3(podium_pose.orientation, clamped_local),
+                );
                 let to_eye = vec3_normalize(vec3_sub(eye_center, raw_pos));
-                let banner_pos = vec3_add(raw_pos, vec3_scale(to_eye, 0.10));
+                let banner_pos = vec3_add(raw_pos, vec3_scale(to_eye, 0.08));
                 let banner_pose = Pose3D {
                     position: banner_pos,
                     orientation: user_facing_orientation(banner_pos, eye_center),
                 };
                 let info = format!(
-                    "{} ({} · {:.1}%)",
+                    "{}  ·  {} ({:.1}%)",
                     entry.name,
                     fs_ops::format_bytes(entry.size),
                     block.weight_ratio * 100.0
@@ -2063,60 +1960,195 @@ impl SpatialFilesApp {
                     &mut scene.quads,
                     &banner_pose,
                     [0.0, 0.0, 0.0],
-                    [0.48, 0.054],
-                    0.016,
-                    [0.05, 0.10, 0.19, 0.94],
-                    [accent[0], accent[1], accent[2], 0.90],
+                    [0.44, 0.048],
+                    0.024,
+                    qk_rgba(255, 255, 255, 0.94),
+                    col_kylin_blue(),
                 );
                 push_panel_text(
                     &mut scene.quads,
                     &banner_pose,
-                    [-0.22, -0.008, 0.006],
+                    [-0.195, -0.007, 0.005],
                     &info,
-                    0.020,
-                    0.44,
-                    [0.96, 0.98, 1.0, 1.0],
+                    0.017,
+                    0.39,
+                    col_ink_navy(),
+                    FontWeight::Bold,
                     glyphs,
                 );
             }
         }
     }
 
-    fn emit_right_inspector_wing(
+    fn emit_companion_window_bar(
         &mut self,
         scene: &mut FrameScene,
+        yaw_deg: f32,
         eye_center: [f32; 3],
         glyphs: &mut GlyphAtlas,
     ) {
-        // Right Wing at -34.5° arc yaw (>3° angular gap from Center Stage)
+        // Signature HyperSpace Qingkong Bottom Window Companion Controls (`control-library.png` 04!)
+        let bar = arc_panel_pose(
+            self.anchor_pos,
+            self.anchor_yaw,
+            yaw_deg,
+            -0.445,
+            self.workspace_radius - 0.02,
+            eye_center,
+        );
+
+        let left_orbs = [
+            ("←", -0.295, HitAction::NavigateBack),
+            ("→", -0.240, HitAction::NavigateForward),
+            ("↑", -0.185, HitAction::NavigateUp),
+            ("⟳", -0.130, HitAction::RecenterWorkspace),
+        ];
+        for (lbl, lx, act) in left_orbs {
+            self.emit_qingkong_pill(
+                scene,
+                &bar,
+                [lx, 0.0, 0.0],
+                [0.044, 0.044],
+                lbl,
+                act,
+                false,
+                false,
+                glyphs,
+            );
+        }
+
+        // Center Window Grab Handle Capsule (`#F5F7FA` outer capsule + `#3790FA` Kylin-Blue core bar!)
+        let grab_world = bar.position;
+        let grab_hit = self.register_hit(
+            grab_world,
+            [0.105, 0.022, 0.02],
+            HitAction::GrabWorkspaceBar,
+        );
+        let grab_hov = self.is_hit_hovered(grab_hit);
+        push_panel_shadow(
+            &mut scene.quads,
+            &bar,
+            [0.0, -0.004, -0.006],
+            [0.20, 0.036],
+            0.018,
+            0.014,
+            0.07,
+        );
+        push_panel_glass(
+            &mut scene.quads,
+            &bar,
+            [0.0, 0.0, if grab_hov { 0.008 } else { 0.0 }],
+            [0.20, 0.036],
+            0.018,
+            if grab_hov {
+                col_pill_hover()
+            } else {
+                col_pill_idle()
+            },
+            col_rim_light(),
+        );
+        push_panel_glass(
+            &mut scene.quads,
+            &bar,
+            [0.0, 0.0, if grab_hov { 0.011 } else { 0.003 }],
+            [0.092, 0.007],
+            0.0035,
+            col_kylin_blue(),
+            [0.0; 4],
+        );
+
+        // Right Page Stepper Pills (`◀`  `1/1`  `▶`)
+        self.emit_qingkong_pill(
+            scene,
+            &bar,
+            [0.145, 0.0, 0.0],
+            [0.044, 0.044],
+            "◀",
+            HitAction::PageDelta(-1),
+            false,
+            false,
+            glyphs,
+        );
+        let ptxt = format!("{}/{}", self.page + 1, self.page_count());
+        push_panel_glass(
+            &mut scene.quads,
+            &bar,
+            [0.205, 0.0, 0.0],
+            [0.062, 0.038],
+            0.019,
+            col_glass_panel(),
+            col_rim_subtle(),
+        );
+        push_panel_text(
+            &mut scene.quads,
+            &bar,
+            [0.187, -0.007, 0.004],
+            &ptxt,
+            0.016,
+            0.05,
+            col_ink_navy(),
+            FontWeight::Bold,
+            glyphs,
+        );
+        self.emit_qingkong_pill(
+            scene,
+            &bar,
+            [0.265, 0.0, 0.0],
+            [0.044, 0.044],
+            "▶",
+            HitAction::PageDelta(1),
+            false,
+            false,
+            glyphs,
+        );
+    }
+
+    fn emit_right_inspector_card(
+        &mut self,
+        scene: &mut FrameScene,
+        yaw_deg: f32,
+        eye_center: [f32; 3],
+        glyphs: &mut GlyphAtlas,
+    ) {
         let panel = arc_panel_pose(
             self.anchor_pos,
             self.anchor_yaw,
-            -34.5,
-            -0.06,
+            yaw_deg,
+            -0.02,
             self.workspace_radius,
             eye_center,
         );
-        let pw = 0.46;
-        let ph = 0.66;
+        let pw = 0.44f32;
+        let ph = 0.74f32;
+
+        push_panel_shadow(
+            &mut scene.quads,
+            &panel,
+            [0.0, -0.010, -0.012],
+            [pw, ph],
+            0.030,
+            0.034,
+            0.085,
+        );
         push_panel_glass(
             &mut scene.quads,
             &panel,
             [0.0, 0.0, 0.0],
             [pw, ph],
-            0.024,
-            [0.05, 0.08, 0.14, 0.84],
-            [0.32, 0.58, 0.94, 0.30],
+            0.030,
+            col_glass_panel(),
+            col_rim_light(),
         );
 
         push_panel_text(
             &mut scene.quads,
             &panel,
-            [-0.20, 0.285, 0.008],
-            "空间全息检视台",
-            0.021,
-            0.40,
-            [0.90, 0.95, 1.0, 1.0],
+            [-0.185, 0.312, 0.006],
+            "空间全息检视",
+            0.022,
+            0.36,
+            col_ink_navy(),
+            FontWeight::Bold,
             glyphs,
         );
 
@@ -2124,30 +2156,46 @@ impl SpatialFilesApp {
             push_panel_text(
                 &mut scene.quads,
                 &panel,
-                [-0.16, 0.02, 0.008],
-                "指向并选择任意空间卡片以预览",
+                [-0.15, 0.02, 0.006],
+                "选择文件卡片查看全息预览",
                 0.018,
-                0.36,
-                [0.65, 0.78, 0.94, 0.85],
+                0.34,
+                col_muted_slate(),
+                FontWeight::Regular,
                 glyphs,
             );
             return;
         };
 
         let entry = self.all_entries[sel_idx].clone();
-        let accent = entry.kind.accent_rgba();
+        // Header icon + filename + metadata
+        let icon_layer = self
+            .thumb_slot_by_path
+            .get(&entry.path)
+            .copied()
+            .unwrap_or_else(|| icon_slot_for_kind(entry.kind));
+        push_textured_quad(
+            &mut scene.quads,
+            &panel,
+            [-0.162, 0.252, 0.006],
+            [0.048, 0.048],
+            0.012,
+            2,
+            icon_layer as f32,
+        );
         push_panel_text(
             &mut scene.quads,
             &panel,
-            [-0.20, 0.242, 0.008],
+            [-0.125, 0.258, 0.006],
             &entry.name,
-            0.020,
-            0.40,
-            [0.98, 0.99, 1.0, 1.0],
+            0.019,
+            0.30,
+            col_ink_navy(),
+            FontWeight::Bold,
             glyphs,
         );
         let meta_line = format!(
-            "{} · {} · {}",
+            "{}  ·  {}  ·  {}",
             entry.kind.label_zh(),
             fs_ops::format_bytes(entry.size),
             fs_ops::format_timestamp_ymd_hm(entry.modified_unix)
@@ -2155,148 +2203,164 @@ impl SpatialFilesApp {
         push_panel_text(
             &mut scene.quads,
             &panel,
-            [-0.20, 0.210, 0.008],
+            [-0.125, 0.232, 0.006],
             &meta_line,
-            0.015,
-            0.40,
-            [accent[0].max(0.5), accent[1].max(0.7), accent[2].max(0.8), 0.95],
+            0.0135,
+            0.30,
+            col_muted_slate(),
+            FontWeight::Regular,
             glyphs,
         );
 
-        // Live Preview Region: 3D Rotating Hologram Mesh, High-Res Image, or Code/Hex Excerpt
-        let has_matching_inspect = self
+        // Warm-White Preview Stage (`#F5F7FA`)
+        push_panel_glass(
+            &mut scene.quads,
+            &panel,
+            [0.0, 0.038, 0.004],
+            [0.385, 0.285],
+            0.020,
+            col_content_well(),
+            col_rim_subtle(),
+        );
+
+        let has_inspect = self
             .previewer
             .active_inspect
             .as_ref()
             .is_some_and(|p| p.path == entry.path);
-
-        if has_matching_inspect {
+        if has_inspect {
             let inspect = self.previewer.active_inspect.as_ref().unwrap().clone();
-            // SIMD Entropy Gauge
-            let ent_ratio = (inspect.inspection.entropy_bits / 8.0).clamp(0.0, 1.0);
             push_panel_text(
                 &mut scene.quads,
                 &panel,
-                [-0.20, 0.178, 0.008],
+                [-0.182, 0.196, 0.006],
                 &inspect.summary_note,
-                0.0145,
-                0.40,
-                [0.72, 0.85, 0.98, 0.92],
+                0.0135,
+                0.36,
+                col_muted_slate(),
+                FontWeight::Regular,
                 glyphs,
             );
+
+            // Sleek Kylin-Blue Shannon Entropy Gauge
+            let ent_ratio = (inspect.inspection.entropy_bits / 8.0).clamp(0.0, 1.0);
             if ent_ratio > 0.0 {
                 push_panel_glass(
                     &mut scene.quads,
                     &panel,
-                    [-0.20 + 0.20 * ent_ratio, 0.162, 0.010],
-                    [0.40 * ent_ratio, 0.005],
-                    0.002,
-                    accent,
-                    [0.0, 0.0, 0.0, 0.0],
+                    [0.0, -0.120, 0.006],
+                    [0.38, 0.007],
+                    0.0035,
+                    qk_rgba(208, 220, 238, 0.85),
+                    [0.0; 4],
+                );
+                let ew = 0.38 * ent_ratio;
+                push_panel_glass(
+                    &mut scene.quads,
+                    &panel,
+                    [-0.19 + 0.5 * ew, -0.120, 0.008],
+                    [ew, 0.007],
+                    0.0035,
+                    col_kylin_blue(),
+                    [0.0; 4],
                 );
             }
 
             if let Some(ref mesh) = inspect.mesh {
-                // Render real 3D stereo rotating hologram mesh floating +9cm in front of the Inspector!
                 let spin = self.start_instant.elapsed().as_secs_f32() * 0.85;
                 let holo_world = vec3_add(
                     panel.position,
-                    quat_rotate_vec3(panel.orientation, [0.0, 0.035, 0.095]),
+                    quat_rotate_vec3(panel.orientation, [0.0, 0.038, 0.095]),
                 );
-                let holo_rot = quat_mul(panel.orientation, quat_from_yaw_pitch(spin, 0.22));
+                let holo_rot = quat_mul(panel.orientation, quat_from_yaw_pitch(spin, 0.24));
                 push_hologram_mesh(
                     &mut scene.solid_vertices,
                     holo_world,
                     holo_rot,
-                    0.18,
+                    0.185,
                     &mesh.vertices,
-                    accent,
+                    qk_rgba(72, 138, 252, 1.0),
                 );
             } else if inspect.image.is_some() {
                 push_textured_quad(
                     &mut scene.quads,
                     &panel,
-                    [0.0, 0.035, 0.014],
-                    [0.38, 0.22],
-                    0.012,
+                    [0.0, 0.038, 0.008],
+                    [0.355, 0.255],
+                    0.016,
                     3,
                     0.0,
                 );
             } else {
-                // Code / Text / Hex preview box
-                push_panel_glass(
-                    &mut scene.quads,
-                    &panel,
-                    [0.0, 0.032, 0.008],
-                    [0.41, 0.23],
-                    0.012,
-                    [0.03, 0.05, 0.09, 0.88],
-                    [0.22, 0.38, 0.64, 0.28],
-                );
-                for (li, line) in inspect.text_lines.iter().take(9).enumerate() {
-                    let ly = 0.120 - (li as f32) * 0.022;
+                for (li, line) in inspect.text_lines.iter().take(10).enumerate() {
+                    let ly = 0.148 - (li as f32) * 0.023;
                     push_panel_text(
                         &mut scene.quads,
                         &panel,
-                        [-0.192, ly, 0.012],
+                        [-0.175, ly, 0.008],
                         line,
                         0.0135,
-                        0.385,
-                        [0.82, 0.91, 0.98, 0.94],
+                        0.35,
+                        col_ink_navy(),
+                        FontWeight::Regular,
                         glyphs,
                     );
                 }
             }
         }
 
-        // Action Buttons at bottom of Inspector
+        // Inspector Action Pills (`#3790FA` Primary CTA + `#F5F7FA` Secondary + Soft Danger)
         let is_trash = self.current_location == TRASH_URI;
         let is_video = entry.kind == FileKind::Video;
         let open_label = if is_video {
-            "空间影院播放"
+            "▶ 空间影院播放"
         } else if entry.kind == FileKind::Directory {
             "进入文件夹"
         } else {
-            "打开项目"
+            "打开文件"
         };
         if !is_trash {
-            self.emit_panel_button(
+            self.emit_qingkong_pill(
                 scene,
                 &panel,
-                [-0.10, -0.145, 0.010],
-                [0.19, 0.044],
+                [-0.098, -0.172, 0.008],
+                [0.185, 0.044],
                 open_label,
                 HitAction::InspectorOpen { cinema: is_video },
                 true,
+                false,
                 glyphs,
             );
-            self.emit_panel_button(
+            self.emit_qingkong_pill(
                 scene,
                 &panel,
-                [0.10, -0.145, 0.010],
-                [0.19, 0.044],
+                [0.098, -0.172, 0.008],
+                [0.185, 0.044],
                 "重命名",
                 HitAction::StartPrompt(PromptMode::Rename),
                 false,
-                glyphs,
-            );
-            self.emit_panel_button(
-                scene,
-                &panel,
-                [-0.10, -0.200, 0.010],
-                [0.19, 0.042],
-                "复制",
-                HitAction::InspectorCopy,
                 false,
                 glyphs,
             );
-            self.emit_panel_button(
+            self.emit_qingkong_pill(
                 scene,
                 &panel,
-                [0.10, -0.200, 0.010],
-                [0.19, 0.042],
+                [-0.098, -0.228, 0.008],
+                [0.185, 0.042],
+                "复制",
+                HitAction::InspectorCopy,
+                false,
+                false,
+                glyphs,
+            );
+            self.emit_qingkong_pill(
+                scene,
+                &panel,
+                [0.098, -0.228, 0.008],
+                [0.185, 0.042],
                 "剪切",
                 HitAction::InspectorCut,
+                false,
                 false,
                 glyphs,
             );
@@ -2306,14 +2370,15 @@ impl SpatialFilesApp {
         } else {
             "移入回收站"
         };
-        self.emit_panel_button(
+        self.emit_qingkong_pill(
             scene,
             &panel,
-            [0.0, -0.258, 0.010],
-            [0.39, 0.044],
+            [0.0, -0.286, 0.008],
+            [0.382, 0.044],
             trash_label,
             HitAction::InspectorTrashOrRestore,
             is_trash,
+            !is_trash,
             glyphs,
         );
     }
@@ -2327,7 +2392,6 @@ impl SpatialFilesApp {
         let Some(menu) = self.context_menu.clone() else {
             return;
         };
-        // Pull context menu 8cm closer toward eye_center so it cleanly floats above cards
         let to_eye = vec3_normalize(vec3_sub(eye_center, menu.anchor_world));
         let pos = vec3_add(menu.anchor_world, vec3_scale(to_eye, 0.08));
         let pose = Pose3D {
@@ -2342,35 +2406,45 @@ impl SpatialFilesApp {
         } else {
             &[
                 ("打开", ContextMenuOp::Open),
-                ("用空间影院播放", ContextMenuOp::OpenCinema),
+                ("空间影院播放", ContextMenuOp::OpenCinema),
                 ("复制", ContextMenuOp::Copy),
                 ("剪切", ContextMenuOp::Cut),
-                ("粘贴到当前目录", ContextMenuOp::Paste),
+                ("粘贴到此处", ContextMenuOp::Paste),
                 ("重命名", ContextMenuOp::Rename),
                 ("移入回收站", ContextMenuOp::TrashOrRestore),
-                ("关闭菜单", ContextMenuOp::Close),
+                ("关闭", ContextMenuOp::Close),
             ]
         };
-        let mh = 0.030 + (items.len() as f32) * 0.043;
+        let mh = 0.032 + (items.len() as f32) * 0.044;
+        push_panel_shadow(
+            &mut scene.quads,
+            &pose,
+            [0.0, -0.008, -0.008],
+            [0.25, mh],
+            0.022,
+            0.024,
+            0.10,
+        );
         push_panel_glass(
             &mut scene.quads,
             &pose,
             [0.0, 0.0, 0.0],
-            [0.26, mh],
-            0.018,
-            [0.04, 0.07, 0.13, 0.94],
-            [0.42, 0.72, 1.0, 0.55],
+            [0.25, mh],
+            0.022,
+            qk_rgba(240, 246, 253, 0.94),
+            col_rim_light(),
         );
         for (i, (label, op)) in items.iter().enumerate() {
-            let ly = 0.5 * mh - 0.032 - (i as f32) * 0.042;
-            self.emit_panel_button(
+            let ly = 0.5 * mh - 0.033 - (i as f32) * 0.043;
+            self.emit_qingkong_pill(
                 scene,
                 &pose,
-                [0.0, ly, 0.008],
-                [0.235, 0.036],
+                [0.0, ly, 0.006],
+                [0.222, 0.037],
                 label,
                 HitAction::ContextAction(*op),
-                false,
+                i == 0,
+                *op == ContextMenuOp::TrashOrRestore && self.current_location != TRASH_URI,
                 glyphs,
             );
         }
@@ -2378,7 +2452,7 @@ impl SpatialFilesApp {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn emit_panel_button(
+    fn emit_qingkong_pill(
         &mut self,
         scene: &mut FrameScene,
         panel: &Pose3D,
@@ -2386,7 +2460,8 @@ impl SpatialFilesApp {
         size_m: [f32; 2],
         label: &str,
         action: HitAction,
-        highlighted: bool,
+        primary_active: bool,
+        danger: bool,
         glyphs: &mut GlyphAtlas,
     ) {
         let world_center = vec3_add(
@@ -2399,27 +2474,54 @@ impl SpatialFilesApp {
             action,
         );
         let hovered = self.is_hit_hovered(hit_idx);
-        let z_bump = if hovered { 0.008 } else { 0.0 };
+        let z_bump = if hovered { 0.007 } else { 0.0 };
         let bumped = [local_offset[0], local_offset[1], local_offset[2] + z_bump];
 
-        let fill = if highlighted {
-            [0.16, 0.42, 0.82, 0.92]
-        } else if hovered {
-            [0.14, 0.24, 0.42, 0.90]
+        let (fill, border, text_col, weight) = if primary_active {
+            (
+                if hovered {
+                    col_kylin_blue_hover()
+                } else {
+                    col_kylin_blue()
+                },
+                [1.0, 1.0, 1.0, 0.45],
+                col_pure_white(),
+                FontWeight::Bold,
+            )
+        } else if danger {
+            (
+                if hovered {
+                    qk_rgba(255, 224, 228, 0.98)
+                } else {
+                    col_danger_soft()
+                },
+                qk_rgba(246, 150, 160, 0.55),
+                col_danger_text(),
+                FontWeight::Bold,
+            )
         } else {
-            [0.08, 0.13, 0.22, 0.82]
+            (
+                if hovered {
+                    col_pill_hover()
+                } else {
+                    col_pill_idle()
+                },
+                if hovered {
+                    col_kylin_blue()
+                } else {
+                    qk_rgba(210, 222, 238, 0.65)
+                },
+                col_ink_navy(),
+                FontWeight::Regular,
+            )
         };
-        let border = if highlighted || hovered {
-            [0.52, 0.82, 1.0, 0.82]
-        } else {
-            [0.28, 0.48, 0.76, 0.28]
-        };
+
         push_panel_glass(
             &mut scene.quads,
             panel,
             bumped,
             size_m,
-            (size_m[1] * 0.36).min(0.014),
+            (size_m[1] * 0.44).min(0.018),
             fill,
             border,
         );
@@ -2427,14 +2529,15 @@ impl SpatialFilesApp {
             &mut scene.quads,
             panel,
             [
-                bumped[0] - size_m[0] * 0.43,
-                bumped[1] - 0.0075,
+                bumped[0] - size_m[0] * 0.40,
+                bumped[1] - 0.0072,
                 bumped[2] + 0.003,
             ],
             label,
-            0.019,
-            size_m[0] * 0.88,
-            [0.95, 0.98, 1.0, 1.0],
+            0.0165,
+            size_m[0] * 0.82,
+            text_col,
+            weight,
             glyphs,
         );
     }
@@ -2461,40 +2564,35 @@ impl SpatialFilesApp {
             }
             self.hovered_hit[h] = new_hover;
 
-            // 6DoF Controller 3D handle body (when grip_pose is away from camera eye)
+            // Sleek pearl-white 6DoF controller silhouette when tracked away from head
             if vec3_len(vec3_sub(ctrl.grip_pose.position, eye_center)) > 0.12 {
                 push_oriented_box(
                     &mut scene.solid_vertices,
                     &ctrl.grip_pose,
-                    [0.0, -0.012, 0.035],
-                    [0.019, 0.016, 0.058],
-                    [0.14, 0.20, 0.30, 1.0],
-                    if ctrl.trigger_pressed || ctrl.squeeze_pressed {
-                        0.45
-                    } else {
-                        0.12
-                    },
+                    [0.0, -0.012, 0.042],
+                    [0.015, 0.013, 0.052],
+                    qk_rgba(242, 246, 252, 1.0),
+                    0.12,
                 );
             }
 
-            // Tapered 3D Volumetric Ray + Surface-Normal-Aligned Reticle (`Constraint 3.2`)
-            let hit_dist = pick.map(|p| p.distance).unwrap_or(2.2);
+            // Delicate Qingkong Kylin-Blue -> White tapered light ray (`Constraint 3.2`)
+            let hit_dist = pick.map(|p| p.distance).unwrap_or(1.95);
+            let ray_start = vec3_add(ctrl.aim_origin, vec3_scale(ctrl.aim_dir, 0.04));
             let ray_end = vec3_add(ctrl.aim_origin, vec3_scale(ctrl.aim_dir, hit_dist));
-            let ray_color = if ctrl.trigger_pressed {
-                [0.35, 0.92, 1.0, 0.95]
-            } else if pick.is_some() {
-                [0.28, 0.72, 1.0, 0.85]
+            let ray_col = if ctrl.trigger_pressed {
+                qk_rgba(55, 144, 250, 0.96)
             } else {
-                [0.24, 0.52, 0.85, 0.45]
+                qk_rgba(245, 250, 255, 0.86)
             };
             push_beam_segment(
                 &mut scene.solid_vertices,
-                vec3_add(ctrl.aim_origin, vec3_scale(ctrl.aim_dir, 0.03)),
+                ray_start,
                 ray_end,
-                0.0028,
-                0.0010,
-                ray_color,
-                0.65,
+                0.0022,
+                0.0009,
+                ray_col,
+                0.45,
             );
 
             if let Some(p) = pick {
@@ -2504,19 +2602,18 @@ impl SpatialFilesApp {
                     position: reticle_pos,
                     orientation: user_facing_orientation(reticle_pos, eye_center),
                 };
-                let r_size = if ctrl.trigger_pressed { 0.018 } else { 0.024 };
+                let r_size = if ctrl.trigger_pressed { 0.016 } else { 0.022 };
                 push_panel_glass(
                     &mut scene.quads,
                     &reticle_pose,
                     [0.0, 0.0, 0.0],
                     [r_size, r_size],
                     r_size * 0.5,
-                    [0.40, 0.88, 1.0, 0.92],
-                    [1.0, 1.0, 1.0, 0.95],
+                    col_pure_white(),
+                    col_kylin_blue(),
                 );
             }
 
-            // Floating 3D Ghost Card during active spatial Drag-and-Drop
             if let Some(ref drag) = self.drag_session {
                 if drag.hand == h && drag.active_drag {
                     let ghost_pos = vec3_add(ray_end, [0.0, 0.045, 0.0]);
@@ -2528,19 +2625,20 @@ impl SpatialFilesApp {
                         &mut scene.quads,
                         &ghost_pose,
                         [0.0, 0.0, 0.02],
-                        [0.24, 0.056],
-                        0.016,
-                        [0.14, 0.42, 0.86, 0.88],
-                        [0.65, 0.92, 1.0, 0.95],
+                        [0.24, 0.052],
+                        0.026,
+                        col_kylin_blue(),
+                        col_pure_white(),
                     );
                     push_panel_text(
                         &mut scene.quads,
                         &ghost_pose,
-                        [-0.105, -0.007, 0.024],
+                        [-0.102, -0.007, 0.024],
                         &format!("移动: {}", drag.primary_label),
                         0.016,
-                        0.21,
-                        [1.0, 1.0, 1.0, 1.0],
+                        0.20,
+                        col_pure_white(),
+                        FontWeight::Bold,
                         glyphs,
                     );
                 }
@@ -2550,8 +2648,36 @@ impl SpatialFilesApp {
 }
 
 // ============================================================================
-// Low-Level Geometry Builders
+// Low-Level Qingkong Geometry Builders
 // ============================================================================
+
+fn push_panel_shadow(
+    quads: &mut Vec<QuadInstance>,
+    panel: &Pose3D,
+    local_offset: [f32; 3],
+    panel_size_m: [f32; 2],
+    radius_m: f32,
+    spread_m: f32,
+    alpha: f32,
+) {
+    let total_w = panel_size_m[0] + spread_m * 2.0;
+    let total_h = panel_size_m[1] + spread_m * 2.0;
+    let center = vec3_add(
+        panel.position,
+        quat_rotate_vec3(panel.orientation, local_offset),
+    );
+    let right_vec = quat_rotate_vec3(panel.orientation, [0.5 * total_w, 0.0, 0.0]);
+    let up_vec = quat_rotate_vec3(panel.orientation, [0.0, 0.5 * total_h, 0.0]);
+    quads.push(QuadInstance {
+        center,
+        right_vec,
+        up_vec,
+        uv_rect: [0.0, 0.0, 0.002, 0.002],
+        fill_color: qk_rgba(28, 48, 84, alpha),
+        border_color: [0.0; 4],
+        params: [radius_m, spread_m, 4.0, 0.0],
+    });
+}
 
 fn push_panel_glass(
     quads: &mut Vec<QuadInstance>,
@@ -2575,7 +2701,7 @@ fn push_panel_glass(
         uv_rect: [0.0, 0.0, 0.002, 0.002],
         fill_color,
         border_color,
-        params: [radius_m, 0.0018, 0.0, 0.0],
+        params: [radius_m, 0.0016, 0.0, 0.0],
     });
 }
 
@@ -2614,13 +2740,13 @@ fn push_panel_text(
     height_m: f32,
     max_width_m: f32,
     color: [f32; 4],
+    weight: FontWeight,
     glyphs: &mut GlyphAtlas,
 ) {
-    // Rasterize at crisp 42px per 20mm (~2100 px/m) for sharp VR readability
-    let raster_px = (height_m * 1900.0).clamp(18.0, 56.0);
+    let raster_px = (height_m * 2400.0).clamp(24.0, 68.0);
     let m_per_px = height_m / raster_px;
     let max_px = (max_width_m / m_per_px).max(16.0);
-    let (laid_out, _) = glyphs.layout_line(text, raster_px, max_px);
+    let (laid_out, _) = glyphs.layout_line_weighted(text, raster_px, max_px, weight);
 
     let right_unit = quat_rotate_vec3(panel.orientation, [1.0, 0.0, 0.0]);
     let up_unit = quat_rotate_vec3(panel.orientation, [0.0, 1.0, 0.0]);
@@ -2628,8 +2754,7 @@ fn push_panel_text(
         panel.position,
         quat_rotate_vec3(panel.orientation, local_origin),
     );
-    // Align vertical origin near text cap-center
-    let top_y_m = height_m * 0.72;
+    let top_y_m = height_m * 0.74;
 
     for (g, gx_px, gy_px) in laid_out {
         let gw_m = g.size_px[0] * m_per_px;
@@ -2647,7 +2772,7 @@ fn push_panel_text(
             up_vec: vec3_scale(up_unit, 0.5 * gh_m),
             uv_rect: [g.uv_min[0], g.uv_min[1], g.uv_max[0], g.uv_max[1]],
             fill_color: color,
-            border_color: [0.0, 0.0, 0.0, 0.0],
+            border_color: [0.0; 4],
             params: [0.0, 0.0, 1.0, 0.0],
         });
     }
@@ -2766,7 +2891,7 @@ fn push_hologram_mesh(
             pos: p,
             normal: n,
             color,
-            emissive: 0.32,
+            emissive: 0.16,
         });
     }
 }

@@ -1,19 +1,21 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Unified `wgpu` 3D Spatial Stereo Renderer for `xr-files`.
-//! Supports:
-//! 1. OpenXR Vulkan HAL external swapchain textures (per-eye single-pass stereo)
-//! 2. Wayland / Desktop `wgpu::Surface` interactive window mode
-//! 3. Headless offscreen Vulkan stereo PNG readback & pixel verification
+//! Unified `wgpu` 3D Spatial Stereo Renderer for `xr-files` (UKUI XR "Qingkong" Edition).
+//! Includes:
+//! - 360° Qingkong equirectangular panorama background (`qingkong-360.png` + procedural fallback)
+//! - Supersampled 2.5D UKUI icon layers (`0..8`) + live SIMD-mipmapped photo thumbnails (`8..64`)
+//! - Daylight hemisphere-lit 3D solids & holograms + exterior-shadowed frosted silver glass
 
 use crate::{
     app::{FrameScene, QuadInstance, SolidVertex},
+    icons::{self, BUILTIN_ICON_COUNT},
     preview::MipmappedRgba,
     simd,
-    spatial::{mat4_view_proj, EyeView},
+    spatial::{mat4_view_proj, quat_normalize, EyeView},
     text::{GlyphAtlas, ATLAS_SIZE},
 };
 use anyhow::{Context, Result};
 use bytemuck::{Pod, Zeroable};
+use std::{env, path::Path};
 use wgpu::util::DeviceExt;
 
 pub const THUMB_SIZE: u32 = 128;
@@ -25,13 +27,15 @@ pub const INSPECT_TEX_SIZE: u32 = 384;
 struct CameraUniform {
     view_proj: [[f32; 4]; 4],
     camera_pos: [f32; 4],
-    light_dir: [f32; 4],
+    camera_quat: [f32; 4],
+    fov_tan: [f32; 4],
 }
 
 pub struct WgpuSpatialRenderer {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub target_format: wgpu::TextureFormat,
+    sky_pipeline: wgpu::RenderPipeline,
     solid_pipeline: wgpu::RenderPipeline,
     quad_pipeline: wgpu::RenderPipeline,
     camera_buffers: [wgpu::Buffer; 2],
@@ -54,7 +58,7 @@ impl WgpuSpatialRenderer {
         target_format: wgpu::TextureFormat,
     ) -> Result<Self> {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("xr-files-spatial-wgsl"),
+            label: Some("xr-files-qingkong-wgsl"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders.wgsl").into()),
         });
 
@@ -108,10 +112,26 @@ impl WgpuSpatialRenderer {
                 wgpu::BindGroupLayoutEntry {
                     binding: 3,
                     visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
             ],
+        });
+
+        let sky_and_quad_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("xr-files-sky-quad-pl"),
+            bind_group_layouts: &[&camera_bgl, &tex_bgl],
+            push_constant_ranges: &[],
         });
 
         let solid_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -120,13 +140,43 @@ impl WgpuSpatialRenderer {
             push_constant_ranges: &[],
         });
 
-        let quad_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("xr-files-quad-pl"),
-            bind_group_layouts: &[&camera_bgl, &tex_bgl],
-            push_constant_ranges: &[],
-        });
-
         let premul_blend = wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING;
+
+        let sky_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("xr-files-qingkong-sky-pipeline"),
+            layout: Some(&sky_and_quad_pl),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_sky"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_sky"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::Always,
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            multiview: None,
+            cache: None,
+        });
 
         let solid_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("xr-files-solid-pipeline"),
@@ -175,7 +225,7 @@ impl WgpuSpatialRenderer {
 
         let quad_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("xr-files-quad-pipeline"),
-            layout: Some(&quad_pl),
+            layout: Some(&sky_and_quad_pl),
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_quad"),
@@ -253,6 +303,13 @@ impl WgpuSpatialRenderer {
             view_formats: &[],
         });
 
+        // Preload supersampled 2.5D UKUI Qingkong icons into slots `0..8`
+        for (slot, icon_mips) in icons::build_qingkong_icons() {
+            if slot < BUILTIN_ICON_COUNT {
+                upload_mip_chain_2d(&queue, &thumb_array_texture, slot, &icon_mips.mips);
+            }
+        }
+
         let inspect_mips = (INSPECT_TEX_SIZE.ilog2() + 1).max(1);
         let inspect_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("xr-files-inspect-tex"),
@@ -269,15 +326,41 @@ impl WgpuSpatialRenderer {
             view_formats: &[],
         });
 
-        // Linear mipmap + anisotropic sampler (Constraint 4.2)
-        let max_aniso = if device
-            .features()
-            .contains(wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER)
-        {
-            8
-        } else {
-            4
-        };
+        let (sky_rgba, sky_w, sky_h) = load_or_synthesize_qingkong_sky();
+        let sky_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("xr-files-qingkong-sky"),
+            size: wgpu::Extent3d {
+                width: sky_w,
+                height: sky_h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &sky_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &sky_rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(sky_w * 4),
+                rows_per_image: Some(sky_h),
+            },
+            wgpu::Extent3d {
+                width: sky_w,
+                height: sky_h,
+                depth_or_array_layers: 1,
+            },
+        );
+
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("xr-files-mip-sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -286,7 +369,7 @@ impl WgpuSpatialRenderer {
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             mipmap_filter: wgpu::FilterMode::Linear,
-            anisotropy_clamp: max_aniso.min(4),
+            anisotropy_clamp: 4,
             ..Default::default()
         });
 
@@ -296,6 +379,7 @@ impl WgpuSpatialRenderer {
             ..Default::default()
         });
         let inspect_view = inspect_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let sky_view = sky_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let texture_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("xr-files-tex-bg"),
@@ -315,6 +399,10 @@ impl WgpuSpatialRenderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&sky_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
                     resource: wgpu::BindingResource::Sampler(&sampler),
                 },
             ],
@@ -323,7 +411,8 @@ impl WgpuSpatialRenderer {
         let default_cam = CameraUniform {
             view_proj: [[0.0; 4]; 4],
             camera_pos: [0.0, 1.6, 0.0, 1.0],
-            light_dir: [0.35, 0.82, 0.45, 0.0],
+            camera_quat: [0.0, 0.0, 0.0, 1.0],
+            fov_tan: [-0.8, 0.8, 0.75, -0.75],
         };
         let cam_buf0 = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("xr-files-cam-0"),
@@ -359,7 +448,7 @@ impl WgpuSpatialRenderer {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let quad_cap = 8_192usize;
+        let quad_cap = 12_288usize;
         let quad_ib = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("xr-files-quad-ib"),
             size: (quad_cap * std::mem::size_of::<QuadInstance>()) as u64,
@@ -371,6 +460,7 @@ impl WgpuSpatialRenderer {
             device,
             queue,
             target_format,
+            sky_pipeline,
             solid_pipeline,
             quad_pipeline,
             camera_buffers: [cam_buf0, cam_buf1],
@@ -398,13 +488,13 @@ impl WgpuSpatialRenderer {
             upload_mip_chain_2d(&self.queue, &self.glyph_texture, 0, &mips);
         }
         for (slot, img) in new_thumbs.drain(..) {
-            if slot < THUMB_LAYERS {
-                let fitted = fit_square_canvas(&img, THUMB_SIZE);
+            if slot >= BUILTIN_ICON_COUNT && slot < THUMB_LAYERS {
+                let fitted = fit_cover_square_canvas(&img, THUMB_SIZE);
                 upload_mip_chain_2d(&self.queue, &self.thumb_array_texture, slot, &fitted);
             }
         }
         if let Some(img) = new_inspect.take() {
-            let fitted = fit_square_canvas(&img, INSPECT_TEX_SIZE);
+            let fitted = fit_cover_square_canvas(&img, INSPECT_TEX_SIZE);
             upload_mip_chain_2d(&self.queue, &self.inspect_texture, 0, &fitted);
         }
     }
@@ -442,8 +532,6 @@ impl WgpuSpatialRenderer {
         }
     }
 
-    /// Renders `views` (1 view in desktop window mode, 2 views in stereo OpenXR/headless mode)
-    /// in a single merged GPU command buffer submission (`Constraint 5.2`).
     pub fn render_views(
         &mut self,
         targets: &[(&wgpu::TextureView, u32, u32, EyeView)],
@@ -462,17 +550,21 @@ impl WgpuSpatialRenderer {
             self.ensure_depth_view(eye_idx, *width, *height);
             let depth_view = &self.depth_textures[eye_idx].as_ref().unwrap().0;
 
+            let q = quat_normalize(eye.orientation);
             let cam = CameraUniform {
                 view_proj: mat4_view_proj(eye, 0.04, 40.0),
                 camera_pos: [eye.position[0], eye.position[1], eye.position[2], 1.0],
-                light_dir: [0.35, 0.82, 0.45, 0.0],
+                camera_quat: q,
+                fov_tan: [
+                    eye.fov[0].tan(),
+                    eye.fov[1].tan(),
+                    eye.fov[2].tan(),
+                    eye.fov[3].tan(),
+                ],
             };
             self.queue
                 .write_buffer(&self.camera_buffers[eye_idx], 0, bytemuck::bytes_of(&cam));
 
-            // Back-to-front sort transparent quads per eye? Note: our quads are emitted in
-            // strict painter's order (distant breadcrumbs -> glass panels -> cards -> buttons/text -> context menu -> reticle),
-            // while opaque 3D extrusions & holograms write to `Depth32Float` first!
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("xr-files-eye-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -480,9 +572,9 @@ impl WgpuSpatialRenderer {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.016 * clear_alpha,
-                            g: 0.028 * clear_alpha,
-                            b: 0.058 * clear_alpha,
+                            r: 0.72 * clear_alpha,
+                            g: 0.84 * clear_alpha,
+                            b: 0.98 * clear_alpha,
                             a: clear_alpha,
                         }),
                         store: wgpu::StoreOp::Store,
@@ -500,6 +592,15 @@ impl WgpuSpatialRenderer {
                 occlusion_query_set: None,
             });
 
+            // 0. Draw 360° Qingkong sky panorama in opaque sessions (keeps passthrough transparent when clear_alpha == 0)
+            if clear_alpha > 0.5 {
+                rpass.set_pipeline(&self.sky_pipeline);
+                rpass.set_bind_group(0, &self.camera_bind_groups[eye_idx], &[]);
+                rpass.set_bind_group(1, &self.texture_bind_group, &[]);
+                rpass.draw(0..3, 0..1);
+            }
+
+            // 1. Draw daylight-lit 3D solids (3D treemap podium/blocks, 3D OBJ/GLB hologram, 6DoF beam)
             if !scene.solid_vertices.is_empty() {
                 rpass.set_pipeline(&self.solid_pipeline);
                 rpass.set_bind_group(0, &self.camera_bind_groups[eye_idx], &[]);
@@ -507,6 +608,7 @@ impl WgpuSpatialRenderer {
                 rpass.draw(0..scene.solid_vertices.len() as u32, 0..1);
             }
 
+            // 2. Draw ordered Qingkong frosted glass, exterior shadows, 2.5D icons & crisp CJK text
             if !scene.quads.is_empty() {
                 rpass.set_pipeline(&self.quad_pipeline);
                 rpass.set_bind_group(0, &self.camera_bind_groups[eye_idx], &[]);
@@ -544,8 +646,6 @@ impl WgpuSpatialRenderer {
         }
     }
 
-    /// Creates a headless Vulkan `wgpu` renderer (works on hardware GPUs and Mesa `lavapipe`)
-    /// for offline stereo pixel regression tests and `--headless` capture.
     pub fn new_headless() -> Result<Self> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN,
@@ -569,7 +669,6 @@ impl WgpuSpatialRenderer {
         Self::new(device, queue, wgpu::TextureFormat::Rgba8UnormSrgb)
     }
 
-    /// Renders a stereo pair (`left`, `right`) offscreen and reads back RGBA8 pixels.
     pub fn render_stereo_offscreen_rgba(
         &mut self,
         width: u32,
@@ -614,6 +713,34 @@ impl WgpuSpatialRenderer {
     }
 }
 
+fn load_or_synthesize_qingkong_sky() -> (Vec<u8>, u32, u32) {
+    let mut candidates = Vec::new();
+    if let Some(custom) = env::var_os("XR_FILES_SKY_PNG") {
+        candidates.push(custom.to_string_lossy().into_owned());
+    }
+    candidates.push("/usr/share/xr/environments/qingkong/qingkong-360.png".into());
+    candidates.push("../xr-environments/environments/qingkong/qingkong-360.png".into());
+    candidates.push("xr-environments/environments/qingkong/qingkong-360.png".into());
+
+    for path in candidates {
+        if !Path::new(&path).is_file() {
+            continue;
+        }
+        if let Ok(img) = image::open(&path) {
+            let scaled = if img.width() > 2048 {
+                img.resize_exact(2048, 1024, image::imageops::FilterType::Triangle)
+            } else {
+                img
+            };
+            let rgba = scaled.to_rgba8();
+            let (w, h) = (rgba.width().max(1), rgba.height().max(1));
+            return (rgba.into_raw(), w, h);
+        }
+    }
+    let (w, h) = (1024, 512);
+    (icons::synthesize_qingkong_panorama(w, h), w, h)
+}
+
 fn upload_mip_chain_2d(
     queue: &wgpu::Queue,
     tex: &wgpu::Texture,
@@ -651,23 +778,21 @@ fn upload_mip_chain_2d(
     }
 }
 
-/// Letterboxes/crops an arbitrary-aspect image onto a fixed `edge × edge` premultiplied RGBA8 canvas
-/// and generates its full SIMD mipmap chain so it fits cleanly into `D2Array` / Inspector textures.
-fn fit_square_canvas(src: &MipmappedRgba, edge: u32) -> Vec<(Vec<u8>, u32, u32)> {
+/// Center-crops (`object-fit: cover`) an image onto an `edge × edge` premultiplied RGBA8 square
+/// so photo thumbnails fill rounded spatial cards edge-to-edge without black bars.
+fn fit_cover_square_canvas(src: &MipmappedRgba, edge: u32) -> Vec<(Vec<u8>, u32, u32)> {
     let (ref base, sw, sh) = src.mips[0];
     let mut canvas = vec![0u8; (edge * edge * 4) as usize];
-    let scale = (edge as f32 / sw.max(1) as f32).min(edge as f32 / sh.max(1) as f32);
-    let dw = ((sw as f32 * scale).round() as u32).clamp(1, edge);
-    let dh = ((sh as f32 * scale).round() as u32).clamp(1, edge);
-    let ox = (edge - dw) / 2;
-    let oy = (edge - dh) / 2;
+    let crop_side = sw.min(sh).max(1);
+    let sx_off = (sw - crop_side) / 2;
+    let sy_off = (sh - crop_side) / 2;
 
-    for y in 0..dh {
-        let sy = ((y as u64 * sh as u64) / dh as u64).min((sh - 1) as u64) as u32;
-        for x in 0..dw {
-            let sx = ((x as u64 * sw as u64) / dw as u64).min((sw - 1) as u64) as u32;
+    for y in 0..edge {
+        let sy = sy_off + ((y as u64 * crop_side as u64) / edge as u64).min((crop_side - 1) as u64) as u32;
+        for x in 0..edge {
+            let sx = sx_off + ((x as u64 * crop_side as u64) / edge as u64).min((crop_side - 1) as u64) as u32;
             let s_off = ((sy * sw + sx) * 4) as usize;
-            let d_off = (((oy + y) * edge + (ox + x)) * 4) as usize;
+            let d_off = ((y * edge + x) * 4) as usize;
             canvas[d_off..d_off + 4].copy_from_slice(&base[s_off..s_off + 4]);
         }
     }

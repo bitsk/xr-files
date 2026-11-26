@@ -2,6 +2,7 @@
 pub mod app;
 pub mod control;
 pub mod fs_ops;
+pub mod icons;
 pub mod preview;
 pub mod renderer;
 pub mod simd;

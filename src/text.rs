@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Pure-Rust CJK + Latin dynamic glyph atlas (`ab_glyph` + built-in fallback)
+//! Pure-Rust CJK + Latin Dual-Weight (`Regular` + `Bold`) Dynamic Glyph Atlas
 //! with 2px padding borders and SIMD-generated mipmap chains (`Constraint 4.2`).
 
 use crate::simd;
@@ -8,6 +8,12 @@ use std::{collections::HashMap, env, fs, path::Path};
 
 pub const ATLAS_SIZE: u32 = 2048;
 const GLYPH_PAD: u32 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FontWeight {
+    Regular,
+    Bold,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct GlyphEntry {
@@ -22,25 +28,25 @@ pub struct GlyphEntry {
 struct GlyphKey {
     ch: char,
     px_tenths: u16,
+    weight: FontWeight,
 }
 
 pub struct GlyphAtlas {
-    font: Option<FontArc>,
+    font_regular: Option<FontArc>,
+    font_bold: Option<FontArc>,
     pub pixels: Vec<u8>,
     cursor_x: u32,
     cursor_y: u32,
     row_height: u32,
     cache: HashMap<GlyphKey, GlyphEntry>,
     pub dirty: bool,
-    /// Solid white 2x2 pixel block at `(1, 1)` for untextured SDF primitives.
     pub white_uv: [f32; 2],
 }
 
 impl GlyphAtlas {
     pub fn new() -> Self {
-        let font = load_system_font();
+        let (font_regular, font_bold) = load_system_fonts();
         let mut pixels = vec![0u8; (ATLAS_SIZE * ATLAS_SIZE * 4) as usize];
-        // Reserve top-left 8x8 corner as opaque premultiplied white for solid primitives
         for y in 0..6u32 {
             for x in 0..6u32 {
                 let idx = ((y * ATLAS_SIZE + x) * 4) as usize;
@@ -48,35 +54,40 @@ impl GlyphAtlas {
             }
         }
         Self {
-            font,
+            font_regular,
+            font_bold,
             pixels,
             cursor_x: 10,
             cursor_y: 2,
             row_height: 10,
-            cache: HashMap::with_capacity(1024),
+            cache: HashMap::with_capacity(1536),
             dirty: true,
             white_uv: [2.5 / ATLAS_SIZE as f32, 2.5 / ATLAS_SIZE as f32],
         }
     }
 
-    pub fn has_system_font(&self) -> bool {
-        self.font.is_some()
-    }
-
-    /// Generates the full RGBA8 mipmap chain using SIMD 2x2 box downsampling.
     pub fn build_mip_chain(&mut self) -> Vec<(Vec<u8>, u32, u32)> {
         self.dirty = false;
         simd::generate_mip_chain_rgba(self.pixels.clone(), ATLAS_SIZE, ATLAS_SIZE)
     }
 
-    /// Measures and lays out single-line text in logical pixels, returning `(glyph, offset_x, offset_y)` quads.
     pub fn layout_line(
         &mut self,
         text: &str,
         px_size: f32,
         max_width_px: f32,
     ) -> (Vec<(GlyphEntry, f32, f32)>, f32) {
-        let px = px_size.clamp(10.0, 96.0);
+        self.layout_line_weighted(text, px_size, max_width_px, FontWeight::Regular)
+    }
+
+    pub fn layout_line_weighted(
+        &mut self,
+        text: &str,
+        px_size: f32,
+        max_width_px: f32,
+        weight: FontWeight,
+    ) -> (Vec<(GlyphEntry, f32, f32)>, f32) {
+        let px = px_size.clamp(12.0, 96.0);
         let mut pen_x = 0.0f32;
         let baseline_y = px * 0.80;
         let mut out = Vec::with_capacity(text.len());
@@ -89,9 +100,9 @@ impl GlyphAtlas {
                 pen_x += px * 1.6;
                 continue;
             }
-            let entry = self.get_or_rasterize(ch, px);
+            let entry = self.get_or_rasterize(ch, px, weight);
             if pen_x + entry.advance_px > max_width_px && max_width_px > 0.0 {
-                let dots = self.get_or_rasterize('…', px);
+                let dots = self.get_or_rasterize('…', px, weight);
                 if pen_x + dots.size_px[0] <= max_width_px + px * 0.5 && dots.size_px[0] > 0.0 {
                     out.push((
                         dots,
@@ -114,13 +125,21 @@ impl GlyphAtlas {
         (out, pen_x)
     }
 
-    fn get_or_rasterize(&mut self, ch: char, px_size: f32) -> GlyphEntry {
+    fn get_or_rasterize(&mut self, ch: char, px_size: f32, weight: FontWeight) -> GlyphEntry {
         let px_tenths = (px_size * 10.0).round() as u16;
-        let key = GlyphKey { ch, px_tenths };
+        let key = GlyphKey {
+            ch,
+            px_tenths,
+            weight,
+        };
         if let Some(&cached) = self.cache.get(&key) {
             return cached;
         }
-        let entry = if let Some(font) = self.font.clone() {
+        let chosen_font = match weight {
+            FontWeight::Bold => self.font_bold.clone().or_else(|| self.font_regular.clone()),
+            FontWeight::Regular => self.font_regular.clone().or_else(|| self.font_bold.clone()),
+        };
+        let entry = if let Some(font) = chosen_font {
             self.rasterize_ab_glyph(&font, ch, px_size)
         } else {
             self.rasterize_fallback(ch, px_size)
@@ -131,7 +150,7 @@ impl GlyphAtlas {
 
     fn rasterize_ab_glyph(&mut self, font: &FontArc, ch: char, px_size: f32) -> GlyphEntry {
         let scaled = font.as_scaled(PxScale::from(px_size));
-        let mut gid = scaled.glyph_id(ch);
+        let gid = scaled.glyph_id(ch);
         if gid.0 == 0 && ch != ' ' {
             return self.rasterize_fallback(ch, px_size);
         }
@@ -147,7 +166,6 @@ impl GlyphAtlas {
         }
         let glyph = gid.with_scale_and_position(PxScale::from(px_size), ab_glyph::point(0.0, 0.0));
         let Some(outlined) = font.outline_glyph(glyph) else {
-            let _ = &mut gid;
             return GlyphEntry {
                 uv_min: self.white_uv,
                 uv_max: self.white_uv,
@@ -170,9 +188,10 @@ impl GlyphAtlas {
         };
         outlined.draw(|x, y, cov| {
             if x < gw && y < gh {
-                let a = (cov.clamp(0.0, 1.0) * 255.0).round() as u8;
+                // Mild optical stem contrast boost (`pow(0.84)`) for dark ink text on light frosted glass
+                let boosted = cov.clamp(0.0, 1.0).powf(0.84);
+                let a = (boosted * 255.0).round() as u8;
                 let idx = (((ay + y) * ATLAS_SIZE + (ax + x)) * 4) as usize;
-                // Premultiplied white glyph pixel: RGB = A, A = A
                 self.pixels[idx] = a;
                 self.pixels[idx + 1] = a;
                 self.pixels[idx + 2] = a;
@@ -213,20 +232,11 @@ impl GlyphAtlas {
                 advance_px: gw as f32 + 2.0,
             };
         };
-        let pattern = mini_glyph_5x7(ch);
         for py in 0..gh {
-            let sy = (py / scale).min(6) as usize;
             for px in 0..gw {
-                let on = if is_wide {
-                    // Clean geometric glyph frame for wide CJK characters when no system font exists
-                    let bx = px / scale;
-                    let by = py / scale;
-                    bx == 0 || bx == 9 || by == 0 || by == 8 || ((bx + by + ch as u32) % 3 == 0)
-                } else {
-                    let sx = (px / scale).min(4);
-                    (pattern[sy] >> (4 - sx)) & 1 != 0
-                };
-                if on {
+                let bx = px / scale;
+                let by = py / scale;
+                if bx == 0 || bx + 1 == gw / scale || by == 0 || by + 1 == gh / scale {
                     let idx = (((ay + py) * ATLAS_SIZE + (ax + px)) * 4) as usize;
                     self.pixels[idx..idx + 4].copy_from_slice(&[255, 255, 255, 255]);
                 }
@@ -261,86 +271,42 @@ impl GlyphAtlas {
     }
 }
 
-fn load_system_font() -> Option<FontArc> {
-    let mut candidates = Vec::new();
-    if let Some(custom) = env::var_os("XR_FILES_FONT") {
-        candidates.push(custom.to_string_lossy().into_owned());
+fn try_load_font(path: &str) -> Option<FontArc> {
+    if !Path::new(path).is_file() {
+        return None;
     }
-    candidates.extend(
-        [
-            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-            "/usr/share/fonts/opentype/noto/NotoSansCJK-DemiLight.ttc",
-            "/usr/share/fonts/opentype/noto/NotoSansCJK-Medium.ttc",
-            "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
-            "/usr/share/fonts/opentype/noto/NotoSansCJK-Light.ttc",
-            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-            "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
-            "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
-            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
-            "/usr/share/fonts/truetype/arphic/uming.ttc",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        ]
-        .into_iter()
-        .map(String::from),
-    );
-
-    for path in candidates {
-        if !Path::new(&path).is_file() {
-            continue;
-        }
-        if let Ok(bytes) = fs::read(&path) {
-            // Try collection index 2 (SC in NotoSansCJK.ttc) first, then index 0
-            if let Ok(vec_font) = FontVec::try_from_vec_and_index(bytes.clone(), 2) {
-                return Some(FontArc::new(vec_font));
-            }
-            if let Ok(font) = FontArc::try_from_vec(bytes) {
-                return Some(font);
-            }
-        }
+    let bytes = fs::read(path).ok()?;
+    if let Ok(vec_font) = FontVec::try_from_vec_and_index(bytes.clone(), 2) {
+        return Some(FontArc::new(vec_font));
     }
-    None
+    FontArc::try_from_vec(bytes).ok()
 }
 
-fn mini_glyph_5x7(ch: char) -> [u8; 7] {
-    match ch.to_ascii_uppercase() {
-        'A' => [0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
-        'B' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110],
-        'C' => [0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110],
-        'D' => [0b11100, 0b10010, 0b10001, 0b10001, 0b10001, 0b10010, 0b11100],
-        'E' => [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111],
-        'F' => [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000],
-        'G' => [0b01110, 0b10001, 0b10000, 0b10111, 0b10001, 0b10001, 0b01110],
-        'H' => [0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
-        'I' => [0b01110, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
-        'J' => [0b00111, 0b00010, 0b00010, 0b00010, 0b10010, 0b10010, 0b01100],
-        'K' => [0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001],
-        'L' => [0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111],
-        'M' => [0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001],
-        'N' => [0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001],
-        'O' | '0' => [0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
-        'P' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000],
-        'Q' => [0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101],
-        'R' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001],
-        'S' | '5' => [0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110],
-        'T' => [0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100],
-        'U' => [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
-        'V' => [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100],
-        'W' => [0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b11011, 0b10001],
-        'X' => [0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001],
-        'Y' => [0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100],
-        'Z' | '2' => [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111],
-        '1' => [0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
-        '3' => [0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110],
-        '4' => [0b10010, 0b10010, 0b10010, 0b11111, 0b00010, 0b00010, 0b00010],
-        '6' => [0b01110, 0b10000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110],
-        '7' => [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000],
-        '8' => [0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110],
-        '9' => [0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00001, 0b01110],
-        '/' => [0b00001, 0b00010, 0b00010, 0b00100, 0b01000, 0b01000, 0b10000],
-        '.' => [0, 0, 0, 0, 0, 0b01100, 0b01100],
-        '-' => [0, 0, 0, 0b11111, 0, 0, 0],
-        '_' => [0, 0, 0, 0, 0, 0, 0b11111],
-        ':' => [0, 0b00100, 0b00100, 0, 0b00100, 0b00100, 0],
-        _ => [0b11111, 0b10001, 0b00100, 0b00100, 0b00000, 0b00100, 0b00000],
+fn load_system_fonts() -> (Option<FontArc>, Option<FontArc>) {
+    if let Some(custom) = env::var_os("XR_FILES_FONT") {
+        let f = try_load_font(&custom.to_string_lossy());
+        return (f.clone(), f);
     }
+    let regular_paths = [
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Medium.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-DemiLight.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
+        "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ];
+    let bold_paths = [
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Bold.otf",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Medium.ttc",
+    ];
+    let reg = regular_paths.iter().find_map(|p| try_load_font(p));
+    let bold = bold_paths
+        .iter()
+        .find_map(|p| try_load_font(p))
+        .or_else(|| reg.clone());
+    (reg, bold)
 }

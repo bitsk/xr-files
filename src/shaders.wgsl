@@ -1,21 +1,79 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// WGSL Spatial Shaders for openKylin XR Files (`xr-files`)
-// - Premultiplied linear alpha composition
-// - Per-eye camera_pos Fresnel & half-angle specular parallax (Constraint 3.1)
-// - GPU analytical rounded-rectangle SDF for zero-CPU-redraw hover/press states (Constraint 5.1)
-// - Lit 3D volumetric extrusions & hologram meshes
+// WGSL Shaders for openKylin XR Files — UKUI XR "Qingkong" (`ukui.spatial.qingkong.light`)
+// - Pipeline 0 (`vs_sky` / `fs_sky`): 360° Qingkong equirectangular panorama background
+// - Pipeline 1 (`vs_solid` / `fs_solid`): Daylight hemisphere-lit 3D podium, pastel-ceramic blocks & 3D holograms
+// - Pipeline 2 (`vs_quad` / `fs_quad`):
+//   * `tex_kind == 4`: Exterior-only feathered drop shadow (zero internal darkening under glass!)
+//   * `tex_kind == 0`: Frosted silver-mist glass (`#E8F0F8`) & warm white (`#F5F7FA`) with directional
+//                      specular rim + per-eye Fresnel & half-angle specular parallax
+//   * `tex_kind == 1`: Premultiplied dual-weight CJK/Latin typography
+//   * `tex_kind == 2`: Mipmapped 2.5D UKUI icon / photo thumbnail inside rounded SDF mask
+//   * `tex_kind == 3`: High-resolution Inspector image inside rounded SDF mask
 
 struct CameraUniform {
     view_proj: mat4x4<f32>,
     camera_pos: vec4<f32>,
-    light_dir: vec4<f32>,
+    camera_quat: vec4<f32>,
+    fov_tan: vec4<f32>, // [tan_left, tan_right, tan_up, tan_down]
 };
 
 @group(0) @binding(0)
 var<uniform> camera: CameraUniform;
 
+@group(1) @binding(0)
+var glyph_tex: texture_2d<f32>;
+@group(1) @binding(1)
+var thumb_array_tex: texture_2d_array<f32>;
+@group(1) @binding(2)
+var inspect_tex: texture_2d<f32>;
+@group(1) @binding(3)
+var sky_tex: texture_2d<f32>;
+@group(1) @binding(4)
+var linear_sampler: sampler;
+
+const PI: f32 = 3.141592653589793;
+
 // ============================================================================
-// Pipeline 1: Lit 3D Solid & Hologram Mesh Pipeline
+// Pipeline 0: 360° Qingkong Equirectangular Panorama Background
+// ============================================================================
+
+struct SkyVertexOut {
+    @builtin(position) clip_pos: vec4<f32>,
+    @location(0) screen_uv: vec2<f32>,
+};
+
+@vertex
+fn vs_sky(@builtin(vertex_index) vid: u32) -> SkyVertexOut {
+    var pos = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>( 3.0, -1.0),
+        vec2<f32>(-1.0,  3.0)
+    );
+    let p = pos[vid];
+    var out: SkyVertexOut;
+    out.clip_pos = vec4<f32>(p, 1.0, 1.0);
+    out.screen_uv = vec2<f32>(0.5 * (p.x + 1.0), 0.5 * (p.y + 1.0));
+    return out;
+}
+
+@fragment
+fn fs_sky(in: SkyVertexOut) -> @location(0) vec4<f32> {
+    // Reconstruct world view ray from per-eye asymmetric FOV + orientation (matching xr-shell panorama.frag)
+    let local_dir = normalize(vec3<f32>(
+        mix(camera.fov_tan.x, camera.fov_tan.y, in.screen_uv.x),
+        mix(camera.fov_tan.w, camera.fov_tan.z, in.screen_uv.y),
+        -1.0
+    ));
+    let q = camera.camera_quat;
+    let d = normalize(local_dir + 2.0 * cross(q.xyz, cross(q.xyz, local_dir) + q.w * local_dir));
+    let u = fract(atan2(d.x, -d.z) / (2.0 * PI) + 0.5);
+    let v = clamp(0.5 - asin(clamp(d.y, -1.0, 1.0)) / PI, 0.001, 0.999);
+    let sky = textureSampleLevel(sky_tex, linear_sampler, vec2<f32>(u, v), 0.0);
+    return vec4<f32>(sky.rgb, 1.0);
+}
+
+// ============================================================================
+// Pipeline 1: Daylight Hemisphere-Lit 3D Solids & Holograms
 // ============================================================================
 
 struct SolidVertexIn {
@@ -48,45 +106,39 @@ fn vs_solid(in: SolidVertexIn) -> SolidVertexOut {
 fn fs_solid(in: SolidVertexOut) -> @location(0) vec4<f32> {
     let n = normalize(in.world_normal);
     let v = normalize(camera.camera_pos.xyz - in.world_pos);
-    let l1 = normalize(camera.light_dir.xyz);
-    let l2 = normalize(vec3<f32>(-0.55, 0.42, 0.72));
+    let sun = normalize(vec3<f32>(-0.42, 0.86, 0.65));
+    let fill = normalize(vec3<f32>(0.55, 0.35, 0.75));
 
-    let ndotl1 = max(dot(n, l1), 0.0);
-    let ndotl2 = max(dot(n, l2), 0.0);
-    let h = normalize(l1 + v);
-    let spec = pow(max(dot(n, h), 0.0), 42.0) * 0.32;
-    let fresnel = pow(1.0 - max(abs(dot(n, v)), 0.0), 3.0);
+    // Qingkong daylight sky/ground hemisphere irradiance
+    let hemi = 0.5 * n.y + 0.5;
+    let env_light = mix(vec3<f32>(0.55, 0.64, 0.82), vec3<f32>(0.96, 0.98, 1.0), hemi);
 
-    let ambient = 0.28;
-    let lit = in.color.rgb * (ambient + 0.56 * ndotl1 + 0.22 * ndotl2);
-    let rim = mix(vec3<f32>(0.35, 0.72, 1.0), in.color.rgb, 0.4) * fresnel * (0.22 + 0.45 * in.emissive);
-    let final_rgb = lit + vec3<f32>(spec) + rim + in.color.rgb * in.emissive * 0.55;
+    let ndotl = max(dot(n, sun), 0.0);
+    let ndotf = max(dot(n, fill), 0.0);
+    let h = normalize(sun + v);
+    let spec = pow(max(dot(n, h), 0.0), 56.0) * 0.28;
+    let fresnel = pow(1.0 - max(abs(dot(n, v)), 0.0), 3.5);
+
+    let lit = in.color.rgb * (env_light * 0.54 + 0.44 * ndotl + 0.14 * ndotf);
+    let rim = vec3<f32>(0.88, 0.95, 1.0) * fresnel * (0.16 + 0.30 * in.emissive);
+    let final_rgb = lit + vec3<f32>(spec) + rim + in.color.rgb * in.emissive * 0.28;
     let a = clamp(in.color.a, 0.0, 1.0);
     return vec4<f32>(final_rgb * a, a);
 }
 
 // ============================================================================
-// Pipeline 2: Instanced Spatial SDF Glass / Card / Text / Thumbnail Quads
+// Pipeline 2: Qingkong Spatial Glass, Soft Exterior Shadow, Icons & Typography
 // ============================================================================
-
-@group(1) @binding(0)
-var glyph_tex: texture_2d<f32>;
-@group(1) @binding(1)
-var thumb_array_tex: texture_2d_array<f32>;
-@group(1) @binding(2)
-var inspect_tex: texture_2d<f32>;
-@group(1) @binding(3)
-var linear_sampler: sampler;
 
 struct QuadInstanceIn {
     @builtin(vertex_index) vid: u32,
     @location(0) center: vec3<f32>,
-    @location(1) right_vec: vec3<f32>,   // length = half_width_m
-    @location(2) up_vec: vec3<f32>,      // length = half_height_m
-    @location(3) uv_rect: vec4<f32>,     // [u0, v0, u1, v1]
-    @location(4) fill_color: vec4<f32>,  // linear RGBA (straight alpha; shader premultiplies)
-    @location(5) border_color: vec4<f32>,
-    @location(6) params: vec4<f32>,      // [corner_radius_m, border_width_m, tex_kind, tex_layer]
+    @location(1) right_vec: vec3<f32>,
+    @location(2) up_vec: vec3<f32>,
+    @location(3) uv_rect: vec4<f32>,
+    @location(4) fill_color: vec4<f32>,   // Linear RGBA
+    @location(5) border_color: vec4<f32>, // Linear RGBA
+    @location(6) params: vec4<f32>,       // [corner_radius_m, border_width_m, tex_kind, tex_layer]
 };
 
 struct QuadVertexOut {
@@ -96,9 +148,10 @@ struct QuadVertexOut {
     @location(2) local_m: vec2<f32>,
     @location(3) half_extents_m: vec2<f32>,
     @location(4) uv: vec2<f32>,
-    @location(5) fill_color: vec4<f32>,
-    @location(6) border_color: vec4<f32>,
-    @location(7) params: vec4<f32>,
+    @location(5) norm_uv: vec2<f32>,
+    @location(6) fill_color: vec4<f32>,
+    @location(7) border_color: vec4<f32>,
+    @location(8) params: vec4<f32>,
 };
 
 fn quad_corner(vid: u32) -> vec2<f32> {
@@ -120,9 +173,9 @@ fn vs_quad(in: QuadInstanceIn) -> QuadVertexOut {
     let world = in.center + in.right_vec * c.x + in.up_vec * c.y;
     let n = normalize(cross(in.right_vec, in.up_vec));
 
-    // UV: c.y = +1 is top (`v0`), c.y = -1 is bottom (`v1`)
-    let u = mix(in.uv_rect.x, in.uv_rect.z, 0.5 * (c.x + 1.0));
-    let v = mix(in.uv_rect.w, in.uv_rect.y, 0.5 * (c.y + 1.0));
+    let nuv = vec2<f32>(0.5 * (c.x + 1.0), 0.5 * (1.0 - c.y)); // (0,0) top-left, (1,1) bottom-right
+    let u = mix(in.uv_rect.x, in.uv_rect.z, nuv.x);
+    let v = mix(in.uv_rect.y, in.uv_rect.w, nuv.y);
 
     var out: QuadVertexOut;
     out.clip_pos = camera.view_proj * vec4<f32>(world, 1.0);
@@ -131,6 +184,7 @@ fn vs_quad(in: QuadInstanceIn) -> QuadVertexOut {
     out.local_m = vec2<f32>(c.x * half_w, c.y * half_h);
     out.half_extents_m = vec2<f32>(half_w, half_h);
     out.uv = vec2<f32>(u, v);
+    out.norm_uv = nuv;
     out.fill_color = in.fill_color;
     out.border_color = in.border_color;
     out.params = in.params;
@@ -148,13 +202,12 @@ fn fs_quad(in: QuadVertexOut) -> @location(0) vec4<f32> {
     let tex_kind = i32(round(in.params.z));
     let tex_layer = i32(round(in.params.w));
 
-    // Always sample textures in uniform control flow for mipmap derivative accuracy
     let glyph_s = textureSample(glyph_tex, linear_sampler, in.uv);
     let thumb_s = textureSample(thumb_array_tex, linear_sampler, in.uv, max(tex_layer, 0));
     let insp_s  = textureSample(inspect_tex, linear_sampler, in.uv);
 
+    // 1. Typography glyph (`tex_kind == 1`)
     if tex_kind == 1 {
-        // Premultiplied white glyph coverage * fill_color
         let cov = glyph_s.a;
         if cov < 0.004 {
             discard;
@@ -163,43 +216,77 @@ fn fs_quad(in: QuadVertexOut) -> @location(0) vec4<f32> {
         return vec4<f32>(in.fill_color.rgb * a, a);
     }
 
+    // 2. Exterior-only feathered drop shadow (`tex_kind == 4`, matching xr-shell material==4)
+    if tex_kind == 4 {
+        let spread = max(in.params.y, 0.008);
+        let inner_half = max(in.half_extents_m - vec2<f32>(spread), vec2<f32>(0.002));
+        let d_shd = sd_rounded_box(in.local_m, inner_half, in.params.x);
+        // Zero alpha inside the panel so translucent frosted glass never gets a muddy gray film!
+        let outside = smoothstep(-0.001, 0.004, d_shd);
+        let falloff = exp(-pow(max(d_shd, 0.0) / (spread * 0.52), 2.0))
+            * (1.0 - smoothstep(spread * 0.72, spread, d_shd));
+        let a = in.fill_color.a * outside * falloff;
+        if a < 0.001 {
+            discard;
+        }
+        return vec4<f32>(in.fill_color.rgb * a, a);
+    }
+
     let d = sd_rounded_box(in.local_m, in.half_extents_m, in.params.x);
-    let aa = max(fwidth(d), 0.00045);
+    let aa = max(fwidth(d), 0.00038);
     let outer_cov = 1.0 - smoothstep(-aa, aa, d);
     if outer_cov < 0.003 {
         discard;
     }
 
-    var base = in.fill_color;
+    // 3. Mipmapped 2.5D UKUI icon or photo thumbnail (`tex_kind == 2`)
     if tex_kind == 2 {
-        // Premultiplied thumbnail array sample inside rounded SDF mask
-        let ta = thumb_s.a * in.fill_color.a * outer_cov;
-        let trgb = thumb_s.rgb * in.fill_color.rgb * in.fill_color.a * outer_cov;
-        return vec4<f32>(trgb, ta);
+        let a = thumb_s.a * in.fill_color.a * outer_cov;
+        if a < 0.003 {
+            discard;
+        }
+        return vec4<f32>(thumb_s.rgb * in.fill_color.rgb * in.fill_color.a * outer_cov, a);
     }
+
+    // 4. High-res Inspector image (`tex_kind == 3`)
     if tex_kind == 3 {
-        // High-res inspector image sample inside rounded SDF mask
-        let ia = insp_s.a * in.fill_color.a * outer_cov;
-        let irgb = insp_s.rgb * in.fill_color.rgb * in.fill_color.a * outer_cov;
-        return vec4<f32>(irgb, ia);
+        let a = insp_s.a * in.fill_color.a * outer_cov;
+        if a < 0.003 {
+            discard;
+        }
+        return vec4<f32>(insp_s.rgb * in.fill_color.rgb * in.fill_color.a * outer_cov, a);
     }
 
-    // Spatial SDF Glass / Button / Card with single-layer crisp border + per-eye specular parallax
-    let bw = in.params.y;
-    var border_mix = 0.0;
-    if bw > 0.0001 {
-        border_mix = smoothstep(-bw - aa, -bw + aa, d);
-    }
-
+    // 5. Qingkong Frosted Glass / Content Card / Pill (`tex_kind == 0`)
     let n = normalize(in.world_normal);
     let toward_eye = normalize(camera.camera_pos.xyz - in.world_pos);
-    let l = normalize(camera.light_dir.xyz);
-    let h = normalize(l + toward_eye);
-    let spec = pow(max(dot(n, h), 0.0), 48.0) * 0.08;
-    let fresnel = pow(1.0 - max(abs(dot(n, toward_eye)), 0.0), 3.5) * 0.06;
+    let light = normalize(vec3<f32>(-0.5, 1.0, 1.0));
+    let facing = clamp(dot(n, toward_eye), 0.0, 1.0);
+    let fresnel = 0.03 + 0.97 * pow(1.0 - facing, 5.0);
+    let spec = pow(max(dot(normal_safe(n), normalize(light + toward_eye)), 0.0), 64.0);
 
-    let col = mix(base, in.border_color, border_mix);
-    let out_a = clamp(col.a * outer_cov, 0.0, 1.0);
-    let out_rgb = col.rgb * out_a + vec3<f32>(spec + fresnel) * outer_cov * step(0.15, col.a);
-    return vec4<f32>(out_rgb, out_a);
+    // Subtle top-to-bottom frost luminance + diagonal soft sheen (like style-reference.png 01/04)
+    let diag_sheen = exp(-pow((in.norm_uv.x * 0.65 + in.norm_uv.y * 0.75 - 0.42) * 3.2, 2.0)) * 0.045;
+    var lit_rgb = in.fill_color.rgb + vec3<f32>(diag_sheen) + vec3<f32>(0.055 * spec + 0.025 * fresnel);
+
+    let bw = in.params.y;
+    var rim_alpha = 0.0;
+    if bw > 0.00005 {
+        let lit_edge = max(1.0 - in.norm_uv.y, (1.0 - in.norm_uv.x) * 0.65);
+        let edge_ring = smoothstep(-bw - aa, -bw + aa, d);
+        rim_alpha = edge_ring * in.border_color.a * mix(0.38, 1.0, lit_edge);
+    }
+
+    let base_a = in.fill_color.a;
+    let base_pm = lit_rgb * base_a;
+    let rim_pm = in.border_color.rgb * rim_alpha;
+
+    // Porter-Duff `rim OVER base`, masked by anti-aliased rounded SDF
+    let combined_pm = rim_pm + base_pm * (1.0 - rim_alpha);
+    let combined_a = clamp(rim_alpha + base_a * (1.0 - rim_alpha), 0.0, 1.0);
+    return vec4<f32>(combined_pm * outer_cov, combined_a * outer_cov);
+}
+
+fn normal_safe(v: vec3<f32>) -> vec3<f32> {
+    return normalize(v);
 }

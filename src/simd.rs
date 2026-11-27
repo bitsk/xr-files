@@ -971,7 +971,8 @@ unsafe fn premultiply_avx2(rgba: &mut [u8]) {
 unsafe fn premultiply_neon(rgba: &mut [u8]) {
     let mut i = 0usize;
     let half = vdupq_n_u16(128);
-    while i + 16 <= rgba.len() {
+    // vld4_u8/vst4_u8 process eight interleaved RGBA pixels (32 bytes).
+    while i + 32 <= rgba.len() {
         let px = vld4_u8(rgba.as_ptr().add(i));
         let a16 = vmovl_u8(px.3);
         let scale = |chan: uint8x8_t| -> uint8x8_t {
@@ -982,7 +983,7 @@ unsafe fn premultiply_neon(rgba: &mut [u8]) {
         };
         let out = uint8x8x4_t(scale(px.0), scale(px.1), scale(px.2), px.3);
         vst4_u8(rgba.as_mut_ptr().add(i), out);
-        i += 16;
+        i += 32;
     }
     if i < rgba.len() {
         premultiply_scalar(&mut rgba[i..]);
@@ -1401,6 +1402,24 @@ mod tests {
         let cjk = filter_and_rank_names(&files, "影院");
         assert_eq!(cjk.len(), 1);
         assert_eq!(cjk[0].0, 3);
+    }
+
+    #[test]
+    fn premultiply_preserves_buffer_bounds_and_scalar_values() {
+        for len in [0, 4, 12, 16, 20, 28, 32, 36, 48, 60, 64, 68] {
+            // Keep a readable guard after the slice to detect NEON stores that
+            // exceed the requested length, including a partial eight-pixel batch.
+            let mut actual: Vec<u8> = (0..len + 32)
+                .map(|i| ((i * 37 + 19) & 0xff) as u8)
+                .collect();
+            let mut expected = actual.clone();
+            premultiply_rgba_in_place(&mut actual[..len]);
+            premultiply_scalar(&mut expected[..len]);
+            assert_eq!(&actual[len..], &expected[len..], "guard overwritten at {len}");
+            for (a, b) in actual[..len].iter().zip(&expected[..len]) {
+                assert!(a.abs_diff(*b) <= 1, "premultiply diff at length {len}: {a} vs {b}");
+            }
+        }
     }
 
     #[test]

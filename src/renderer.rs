@@ -45,6 +45,7 @@ pub struct WgpuSpatialRenderer {
     thumb_array_texture: wgpu::Texture,
     inspect_texture: wgpu::Texture,
     depth_textures: [Option<(wgpu::TextureView, u32, u32)>; 2],
+    wayland_offscreen: Option<(wgpu::Texture, wgpu::TextureView, wgpu::Buffer, u32, u32, u32)>,
     solid_vb: wgpu::Buffer,
     solid_vb_cap: usize,
     quad_ib: wgpu::Buffer,
@@ -470,6 +471,7 @@ impl WgpuSpatialRenderer {
             thumb_array_texture,
             inspect_texture,
             depth_textures: [None, None],
+            wayland_offscreen: None,
             solid_vb,
             solid_vb_cap: solid_cap,
             quad_ib,
@@ -649,6 +651,7 @@ impl WgpuSpatialRenderer {
     pub fn new_headless() -> Result<Self> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN,
+            flags: wgpu::InstanceFlags::ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER,
             ..Default::default()
         });
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -667,6 +670,168 @@ impl WgpuSpatialRenderer {
             None,
         ))?;
         Self::new(device, queue, wgpu::TextureFormat::Rgba8UnormSrgb)
+    }
+
+    /// Renders a single transparent-background (`clear_alpha = 0.0`) frame on Vulkan GPU
+    /// and writes Cairo/Wayland-compatible premultiplied sRGB `Argb8888` (`[B, G, R, A]` on little-endian)
+    /// directly into `dst_argb8888`, reusing persistent GPU texture & staging buffers.
+    pub fn render_offscreen_wayland_argb8888(
+        &mut self,
+        width: u32,
+        height: u32,
+        eye: EyeView,
+        scene: &FrameScene,
+        dst_argb8888: &mut [u8],
+    ) -> Result<()> {
+        let width = width.max(1);
+        let height = height.max(1);
+        anyhow::ensure!(
+            dst_argb8888.len() >= (width as usize) * (height as usize) * 4,
+            "dst_argb8888 buffer too small"
+        );
+
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let unpadded = width * 4;
+        let padded_bpr = ((unpadded + align - 1) / align) * align;
+
+        let needs_alloc = match &self.wayland_offscreen {
+            Some((_, _, _, w, h, _)) => *w != width || *h != height,
+            None => true,
+        };
+        if needs_alloc {
+            let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("xr-files-wayland-color"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: self.target_format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+            let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("xr-files-wayland-staging"),
+                size: (padded_bpr as u64) * (height as u64),
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            self.wayland_offscreen = Some((tex, view, staging, width, height, padded_bpr));
+        }
+
+        // Borrow view via temporary raw split or render before copy
+        self.upload_scene(scene);
+        self.ensure_depth_view(0, width, height);
+
+        let (tex, view, staging, _, _, bpr) = self.wayland_offscreen.as_ref().unwrap();
+        let depth_view = &self.depth_textures[0].as_ref().unwrap().0;
+
+        let q = quat_normalize(eye.orientation);
+        let cam = CameraUniform {
+            view_proj: mat4_view_proj(&eye, 0.04, 40.0),
+            camera_pos: [eye.position[0], eye.position[1], eye.position[2], 1.0],
+            camera_quat: q,
+            fov_tan: [
+                eye.fov[0].tan(),
+                eye.fov[1].tan(),
+                eye.fov[2].tan(),
+                eye.fov[3].tan(),
+            ],
+        };
+        self.queue
+            .write_buffer(&self.camera_buffers[0], 0, bytemuck::bytes_of(&cam));
+
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("xr-files-wayland-enc"),
+            });
+        {
+            let mut rpass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("xr-files-wayland-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            if !scene.solid_vertices.is_empty() {
+                rpass.set_pipeline(&self.solid_pipeline);
+                rpass.set_bind_group(0, &self.camera_bind_groups[0], &[]);
+                rpass.set_vertex_buffer(0, self.solid_vb.slice(..));
+                rpass.draw(0..scene.solid_vertices.len() as u32, 0..1);
+            }
+            if !scene.quads.is_empty() {
+                rpass.set_pipeline(&self.quad_pipeline);
+                rpass.set_bind_group(0, &self.camera_bind_groups[0], &[]);
+                rpass.set_bind_group(1, &self.texture_bind_group, &[]);
+                rpass.set_vertex_buffer(0, self.quad_ib.slice(..));
+                rpass.draw(0..6, 0..scene.quads.len() as u32);
+            }
+        }
+        enc.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: staging,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(*bpr),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit(std::iter::once(enc.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        rx.recv()??;
+
+        let mapped = slice.get_mapped_range();
+        let lut = srgb_premul_alpha_lut();
+        let row_bytes = (width as usize) * 4;
+        for row in 0..height as usize {
+            let src_off = row * (*bpr as usize);
+            let dst_off = row * row_bytes;
+            convert_hw_rgba_srgb_to_wayland_argb8888(
+                &mapped[src_off..src_off + row_bytes],
+                &mut dst_argb8888[dst_off..dst_off + row_bytes],
+                lut,
+            );
+        }
+        drop(mapped);
+        staging.unmap();
+        Ok(())
     }
 
     pub fn render_stereo_offscreen_rgba(
@@ -857,4 +1022,49 @@ fn readback_texture_rgba(
     drop(mapped);
     staging.unmap();
     Ok(out)
+}
+
+fn srgb_premul_alpha_lut() -> &'static [u16; 256] {
+    static LUT: std::sync::OnceLock<[u16; 256]> = std::sync::OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut table = [0u16; 256];
+        table[255] = 256;
+        for a in 1..255usize {
+            let af = (a as f32) / 255.0;
+            // Hardware `Rgba8UnormSrgb` stores `srgb(L * a) ≈ srgb(L) * a^(1/2.2)`.
+            // Wayland/Cairo `Argb8888` (`xr-shell` `spatial.frag`) expects `srgb(L) * a`,
+            // which equals `hw_byte * a^(1 - 1/2.2) = hw_byte * a^0.54545`.
+            table[a] = (af.powf(0.54545456) * 256.0).round().clamp(0.0, 256.0) as u16;
+        }
+        table
+    })
+}
+
+/// Converts GPU `Rgba8UnormSrgb` (linear-premultiplied) pixels into Wayland `wl_shm::Format::Argb8888`
+/// (`[B, G, R, A]` sRGB-premultiplied on little-endian), matching `xr-shell`'s `spatial.frag`.
+pub fn convert_hw_rgba_srgb_to_wayland_argb8888(
+    src_rgba: &[u8],
+    dst_bgra: &mut [u8],
+    lut: &[u16; 256],
+) {
+    for (s, d) in src_rgba.chunks_exact(4).zip(dst_bgra.chunks_exact_mut(4)) {
+        let a = s[3];
+        if a == 255 {
+            d[0] = s[2];
+            d[1] = s[1];
+            d[2] = s[0];
+            d[3] = 255;
+        } else if a == 0 {
+            d[0] = 0;
+            d[1] = 0;
+            d[2] = 0;
+            d[3] = 0;
+        } else {
+            let k = lut[a as usize];
+            d[0] = (((s[2] as u16 * k + 128) >> 8) as u8).min(a);
+            d[1] = (((s[1] as u16 * k + 128) >> 8) as u8).min(a);
+            d[2] = (((s[0] as u16 * k + 128) >> 8) as u8).min(a);
+            d[3] = a;
+        }
+    }
 }

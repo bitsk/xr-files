@@ -15,7 +15,7 @@ use xr_files::{
     simd,
     spatial::{EyeView, Pose3D},
     text::GlyphAtlas,
-    window_mode, xr_runtime,
+    wayland_shm, window_mode, xr_runtime,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,33 +132,43 @@ fn main() -> Result<()> {
 
     match mode {
         RunMode::Headless => run_headless(&mut app, ctl.as_ref(), max_seconds, capture_dir),
-        RunMode::Window => window_mode::run_window(&mut app, ctl.as_ref()),
+        RunMode::Window => run_desktop_coexisting(&mut app, ctl.as_ref(), max_seconds),
         RunMode::OpenXr => xr_runtime::run_openxr(&mut app, ctl.as_ref(), max_seconds),
         RunMode::Auto => {
-            let prefer_xr = env::var_os("XR_RUNTIME_JSON").is_some()
+            // Default to coexisting inside HyperSpace Wayland (`xr-wayland-*`) or desktop window
+            // so background Qingkong panorama, 3-island Dock, other windows, and unified
+            // Shell drag/resize/curve interactions remain active!
+            if env::var_os("WAYLAND_DISPLAY").is_some() || env::var_os("DISPLAY").is_some() {
+                run_desktop_coexisting(&mut app, ctl.as_ref(), max_seconds)
+            } else if env::var_os("XR_RUNTIME_JSON").is_some()
                 || env::var_os("XR_APPLICATION_ID").is_some()
-                || xr_runtime::probe_openxr_available();
-            if prefer_xr {
-                match xr_runtime::run_openxr(&mut app, ctl.as_ref(), max_seconds) {
-                    Ok(()) => Ok(()),
-                    Err(xr_err) => {
-                        if env::var_os("WAYLAND_DISPLAY").is_some()
-                            || env::var_os("DISPLAY").is_some()
-                        {
-                            eprintln!(
-                                "OpenXR 会话未就绪 ({xr_err})，自动回退至空间桌面窗口模式"
-                            );
-                            window_mode::run_window(&mut app, ctl.as_ref())
-                        } else {
-                            Err(xr_err)
-                        }
-                    }
-                }
+                || xr_runtime::probe_openxr_available()
+            {
+                xr_runtime::run_openxr(&mut app, ctl.as_ref(), max_seconds)
             } else {
-                window_mode::run_window(&mut app, ctl.as_ref())
+                run_desktop_coexisting(&mut app, ctl.as_ref(), max_seconds)
             }
         }
     }
+}
+
+fn run_desktop_coexisting(
+    app: &mut SpatialFilesApp,
+    control: Option<&ControlServer>,
+    max_seconds: Option<u64>,
+) -> Result<()> {
+    if env::var_os("WAYLAND_DISPLAY").is_some() {
+        match wayland_shm::run_wayland_shm(app, control, max_seconds) {
+            Ok(()) => return Ok(()),
+            Err(wl_err) => {
+                if env::var_os("DISPLAY").is_none() {
+                    return Err(wl_err);
+                }
+                eprintln!("Wayland SHM 通道回退至桌面窗口模式: {wl_err:#}");
+            }
+        }
+    }
+    window_mode::run_window(app, control)
 }
 
 fn run_headless(

@@ -277,6 +277,7 @@ pub struct SpatialFilesApp {
     pub anchor_yaw: f32,
     pub workspace_radius: f32,
     pub card_scale: f32,
+    pub embedded_panel: bool,
     anchor_initialized: bool,
     recenter_requested: bool,
     shutdown_flag: bool,
@@ -356,6 +357,7 @@ impl SpatialFilesApp {
             anchor_yaw: 0.0,
             workspace_radius: 1.24,
             card_scale: 1.0,
+            embedded_panel: false,
             anchor_initialized: false,
             recenter_requested: false,
             shutdown_flag: false,
@@ -405,6 +407,63 @@ impl SpatialFilesApp {
 
     pub fn take_haptics(&mut self) -> [Option<HapticEvent>; 2] {
         std::mem::take(&mut self.pending_haptics)
+    }
+
+    pub fn set_embedded_panel(&mut self, embedded: bool) {
+        self.embedded_panel = embedded;
+        if embedded {
+            self.anchor_pos = [0.0, 1.60, 0.0];
+            self.anchor_yaw = 0.0;
+            self.workspace_radius = 1.24;
+            self.anchor_initialized = true;
+        }
+    }
+
+    /// Computes an aspect-preserving camera frustum that frames the coplanar two-pane
+    /// Spatial Workbench + Right Preview Stage inside a HyperSpace Wayland surface.
+    pub fn embedded_eye(width: u32, height: u32) -> EyeView {
+        let aspect = (width.max(1) as f32 / height.max(1) as f32).clamp(0.6, 4.0);
+        let tan_x0 = 0.905f32 / 1.24f32;
+        let tan_y0 = 0.402f32 / 1.24f32;
+        let design_aspect = tan_x0 / tan_y0;
+        let (tan_x, tan_y) = if aspect >= design_aspect {
+            (tan_y0 * aspect, tan_y0)
+        } else {
+            (tan_x0, tan_x0 / aspect)
+        };
+        let hx = tan_x.atan();
+        let hy = tan_y.atan();
+        EyeView {
+            position: [0.0, 1.60, 0.0],
+            orientation: [0.0, 0.0, 0.0, 1.0],
+            fov: [-hx, hx, hy, -hy],
+        }
+    }
+
+    /// Returns `true` when background thumbnails, hover springs, or a 3D hologram mesh require active animation frames.
+    pub fn has_active_animation(&self) -> bool {
+        if !self.pending_gpu_thumbs.is_empty() || self.pending_gpu_inspect_image.is_some() {
+            return true;
+        }
+        if self
+            .previewer
+            .active_inspect
+            .as_ref()
+            .is_some_and(|p| p.mesh.is_some())
+        {
+            return true;
+        }
+        let spring_moving = self
+            .slot_z_cur
+            .iter()
+            .zip(self.slot_z_tgt.iter())
+            .any(|(a, b)| (a - b).abs() > 0.0005)
+            || self
+                .treemap_lift_cur
+                .iter()
+                .zip(self.treemap_lift_tgt.iter())
+                .any(|(a, b)| (a - b).abs() > 0.0005);
+        spring_moving
     }
 
     pub fn status_snapshot(&self) -> StatusSnapshot {
@@ -855,13 +914,20 @@ impl SpatialFilesApp {
         self.hit_batch.clear();
         self.hit_actions.clear();
 
-        let main_yaw_deg = 9.5;
-        let insp_yaw_deg = -30.5;
-
-        self.emit_depth_breadcrumbs(&mut scene, main_yaw_deg, eye_center, glyphs);
-        self.emit_main_qingkong_window(&mut scene, main_yaw_deg, eye_center, hands, glyphs);
-        self.emit_minimal_companion_bar(&mut scene, main_yaw_deg, eye_center, glyphs);
-        self.emit_right_gallery_stage(&mut scene, insp_yaw_deg, eye_center, glyphs);
+        if self.embedded_panel {
+            self.anchor_pos = [0.0, 1.60, 0.0];
+            self.anchor_yaw = 0.0;
+            self.workspace_radius = 1.24;
+            self.emit_main_qingkong_window(&mut scene, 0.0, eye_center, hands, glyphs);
+            self.emit_right_gallery_stage(&mut scene, 0.0, eye_center, glyphs);
+        } else {
+            let main_yaw_deg = 9.5;
+            let insp_yaw_deg = -30.5;
+            self.emit_depth_breadcrumbs(&mut scene, main_yaw_deg, eye_center, glyphs);
+            self.emit_main_qingkong_window(&mut scene, main_yaw_deg, eye_center, hands, glyphs);
+            self.emit_minimal_companion_bar(&mut scene, main_yaw_deg, eye_center, glyphs);
+            self.emit_right_gallery_stage(&mut scene, insp_yaw_deg, eye_center, glyphs);
+        }
         if self.context_menu.is_some() {
             self.emit_context_menu(&mut scene, eye_center, glyphs);
         }
@@ -1282,44 +1348,113 @@ impl SpatialFilesApp {
         hands: &[HandControllerInput; 2],
         glyphs: &mut GlyphAtlas,
     ) {
-        let win = arc_panel_pose(
-            self.anchor_pos,
-            self.anchor_yaw,
-            yaw_deg,
-            -0.01,
-            self.workspace_radius,
-            eye_center,
-        );
+        let win = if self.embedded_panel {
+            Pose3D {
+                position: [-0.242, 1.60, -1.24],
+                orientation: [0.0, 0.0, 0.0, 1.0],
+            }
+        } else {
+            arc_panel_pose(
+                self.anchor_pos,
+                self.anchor_yaw,
+                yaw_deg,
+                -0.01,
+                self.workspace_radius,
+                eye_center,
+            )
+        };
         let win_w = 1.28f32;
         let win_h = 0.76f32;
 
-        push_panel_shadow(
-            &mut scene.quads,
-            &win,
-            [0.0, -0.010, -0.012],
-            [win_w, win_h],
-            0.034,
-            0.036,
-            0.075,
-        );
+        if !self.embedded_panel {
+            push_panel_shadow(
+                &mut scene.quads,
+                &win,
+                [0.0, -0.010, -0.012],
+                [win_w, win_h],
+                0.034,
+                0.036,
+                0.075,
+            );
+        }
         push_panel_glass(
             &mut scene.quads,
             &win,
             [0.0, 0.0, 0.0],
             [win_w, win_h],
             0.034,
-            col_glass_window(),
+            if self.embedded_panel {
+                qk_rgba(236, 244, 252, 0.84)
+            } else {
+                col_glass_window()
+            },
             col_rim_luminous(),
         );
 
         // ====================================================================
         // Icon-First Minimalist Header Row (Zero text-button clutter!)
         // ====================================================================
+        if self.embedded_panel {
+            // In HyperSpace coexisting mode, Shell owns the bottom companion bar,
+            // so place crisp `←` Back and `↑` Parent orbs right in the header!
+            self.emit_icon_orb(
+                scene,
+                &win,
+                [-0.590, 0.328, 0.006],
+                0.032,
+                UiIcon::BackLeft,
+                HitAction::NavigateBack,
+                false,
+                false,
+                Some("返回"),
+                glyphs,
+            );
+            self.emit_icon_orb(
+                scene,
+                &win,
+                [-0.550, 0.328, 0.006],
+                0.032,
+                UiIcon::UpArrow,
+                HitAction::NavigateUp,
+                false,
+                false,
+                Some("上层"),
+                glyphs,
+            );
+            if self.page_count() > 1 {
+                self.emit_icon_orb(
+                    scene,
+                    &win,
+                    [0.240, 0.328, 0.006],
+                    0.030,
+                    UiIcon::ChevronLeft,
+                    HitAction::PageDelta(-1),
+                    false,
+                    false,
+                    None,
+                    glyphs,
+                );
+                self.emit_icon_orb(
+                    scene,
+                    &win,
+                    [0.276, 0.328, 0.006],
+                    0.030,
+                    UiIcon::ChevronRight,
+                    HitAction::PageDelta(1),
+                    false,
+                    false,
+                    None,
+                    glyphs,
+                );
+            }
+        }
+        let header_folder_x = if self.embedded_panel { -0.506 } else { -0.578 };
+        let header_title_x = if self.embedded_panel { -0.472 } else { -0.542 };
         push_textured_quad(
             &mut scene.quads,
             &win,
-            [-0.578, 0.328, 0.005],
-            [0.038, 0.038],
+            [header_folder_x, 0.328, 0.005],
+            [0.036, 0.036],
             0.006,
             2,
             0.0,
@@ -1335,10 +1470,10 @@ impl SpatialFilesApp {
         push_panel_text(
             &mut scene.quads,
             &win,
-            [-0.542, 0.320, 0.006],
+            [header_title_x, 0.320, 0.006],
             &dir_short,
-            0.022,
-            0.22,
+            0.021,
+            0.19,
             col_ink_navy(),
             FontWeight::Bold,
             glyphs,
@@ -2219,33 +2354,46 @@ impl SpatialFilesApp {
         eye_center: [f32; 3],
         glyphs: &mut GlyphAtlas,
     ) {
-        let panel = arc_panel_pose(
-            self.anchor_pos,
-            self.anchor_yaw,
-            yaw_deg,
-            -0.01,
-            self.workspace_radius,
-            eye_center,
-        );
+        let panel = if self.embedded_panel {
+            Pose3D {
+                position: [0.653, 1.60, -1.24],
+                orientation: [0.0, 0.0, 0.0, 1.0],
+            }
+        } else {
+            arc_panel_pose(
+                self.anchor_pos,
+                self.anchor_yaw,
+                yaw_deg,
+                -0.01,
+                self.workspace_radius,
+                eye_center,
+            )
+        };
         let pw = 0.45f32;
         let ph = 0.76f32;
 
-        push_panel_shadow(
-            &mut scene.quads,
-            &panel,
-            [0.0, -0.010, -0.012],
-            [pw, ph],
-            0.032,
-            0.034,
-            0.075,
-        );
+        if !self.embedded_panel {
+            push_panel_shadow(
+                &mut scene.quads,
+                &panel,
+                [0.0, -0.010, -0.012],
+                [pw, ph],
+                0.032,
+                0.034,
+                0.075,
+            );
+        }
         push_panel_glass(
             &mut scene.quads,
             &panel,
             [0.0, 0.0, 0.0],
             [pw, ph],
             0.032,
-            col_glass_window(),
+            if self.embedded_panel {
+                qk_rgba(236, 244, 252, 0.84)
+            } else {
+                col_glass_window()
+            },
             col_rim_luminous(),
         );
 
@@ -2720,15 +2868,17 @@ impl SpatialFilesApp {
             let hit_dist = pick.map(|p| p.distance).unwrap_or(1.85);
             let ray_start = vec3_add(ctrl.aim_origin, vec3_scale(ctrl.aim_dir, 0.14));
             let ray_end = vec3_add(ctrl.aim_origin, vec3_scale(ctrl.aim_dir, hit_dist));
-            push_beam_segment(
-                &mut scene.solid_vertices,
-                ray_start,
-                ray_end,
-                0.0014,
-                0.0006,
-                qk_rgba(255, 255, 255, 0.72),
-                0.35,
-            );
+            if !self.embedded_panel {
+                push_beam_segment(
+                    &mut scene.solid_vertices,
+                    ray_start,
+                    ray_end,
+                    0.0014,
+                    0.0006,
+                    qk_rgba(255, 255, 255, 0.72),
+                    0.35,
+                );
+            }
 
             if let Some(p) = pick {
                 let normal = vec3_normalize(vec3_sub(eye_center, p.hit_point));

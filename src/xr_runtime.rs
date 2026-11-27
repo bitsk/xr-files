@@ -69,16 +69,27 @@ pub fn run_openxr(
         .context("未检测到 OpenXR 头显系统，请检查运行时与头显连接")?;
 
     let blend_modes = xr_instance.enumerate_environment_blend_modes(system, STEREO)?;
-    // Prefer ALPHA_BLEND passthrough when available, falling back to OPAQUE / ADDITIVE
-    let blend = [
-        xr::EnvironmentBlendMode::ALPHA_BLEND,
-        xr::EnvironmentBlendMode::OPAQUE,
-        xr::EnvironmentBlendMode::ADDITIVE,
-    ]
-    .into_iter()
-    .find(|m| blend_modes.contains(m))
-    .context("OpenXR 运行时无可用混合模式")?;
-    let clear_alpha = if blend == xr::EnvironmentBlendMode::ALPHA_BLEND {
+    let want_passthrough = env::var("XR_FILES_PASSTHROUGH")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let preferred_modes = if want_passthrough {
+        [
+            xr::EnvironmentBlendMode::ALPHA_BLEND,
+            xr::EnvironmentBlendMode::OPAQUE,
+            xr::EnvironmentBlendMode::ADDITIVE,
+        ]
+    } else {
+        [
+            xr::EnvironmentBlendMode::OPAQUE,
+            xr::EnvironmentBlendMode::ALPHA_BLEND,
+            xr::EnvironmentBlendMode::ADDITIVE,
+        ]
+    };
+    let blend = preferred_modes
+        .into_iter()
+        .find(|m| blend_modes.contains(m))
+        .context("OpenXR 运行时无可用混合模式")?;
+    let clear_alpha = if blend == xr::EnvironmentBlendMode::ALPHA_BLEND && want_passthrough {
         0.0
     } else {
         1.0
@@ -357,6 +368,7 @@ pub fn run_openxr(
                 display_time,
                 blend,
                 &[&xr::CompositionLayerProjection::new()
+                    .layer_flags(xr::CompositionLayerFlags::BLEND_TEXTURE_SOURCE_ALPHA)
                     .space(active_space)
                     .views(&proj_views)],
             )?;

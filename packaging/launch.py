@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-"""Launch openKylin XR Files in native OpenXR stereo or HyperSpace Wayland mode."""
+"""Launch openKylin XR Files coexisting inside HyperSpace Wayland by default,
+or as a standalone foreground OpenXR session only when `--xr` is explicitly passed."""
 
+import glob
 import json
 import os
 from pathlib import Path
@@ -55,31 +57,64 @@ def restore(controller, previous, current_app):
         controller.show(prior)
 
 
+def discover_active_hyperspace_wayland(environment):
+    """If invoked from CLI/SSH without WAYLAND_DISPLAY while HyperSpace (`xr-shell-session`)
+    is running for this UID, attach to its private `xr-wayland-*` socket and Vulkan ICD."""
+    wayland = environment.get("WAYLAND_DISPLAY")
+    xdg_rt = environment.get("XDG_RUNTIME_DIR")
+    if wayland and xdg_rt and (Path(xdg_rt) / wayland).is_socket():
+        return
+    uid = os.getuid()
+    pattern = f"/run/user/{uid}/xr-desktop-dev.*/runtime/xr-wayland-*"
+    candidates = sorted(
+        (Path(p) for p in glob.glob(pattern) if Path(p).is_socket()),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if candidates:
+        sock = candidates[0]
+        environment["XDG_RUNTIME_DIR"] = str(sock.parent)
+        environment["WAYLAND_DISPLAY"] = sock.name
+    kms_icd = Path("/usr/lib/aarch64-linux-gnu/xr-mesa/icd.d/freedreno_icd.aarch64.json")
+    if kms_icd.is_file() and not environment.get("VK_ICD_FILENAMES"):
+        environment["VK_DRIVER_FILES"] = str(kms_icd)
+        environment["VK_ICD_FILENAMES"] = str(kms_icd)
+        extra_ld = "/opt/mix-native-dependencies/lib:/usr/lib/aarch64-linux-gnu/xr-mesa"
+        cur_ld = environment.get("LD_LIBRARY_PATH", "")
+        environment["LD_LIBRARY_PATH"] = f"{extra_ld}:{cur_ld}" if cur_ld else extra_ld
+
+
 def launch(arguments):
     binary = Path(__file__).resolve().parents[2] / "bin/xr-files"
     exe = str(binary) if binary.is_file() else "xr-files"
     command = [exe, *arguments]
     environment = dict(os.environ)
 
+    options = arguments[: arguments.index("--")] if "--" in arguments else arguments
+    if options[:1] == ["ctl"] or {"-h", "--help", "-V", "--version", "--headless"}.intersection(
+        options
+    ):
+        os.execvpe(command[0], command, environment)
+
+    explicit_xr = "--xr" in options
+
+    # Default behavior: coexist inside HyperSpace desktop (keeping Qingkong sky, Dock,
+    # other windows, and unified Shell drag/resize/curve controls)!
+    if not explicit_xr:
+        discover_active_hyperspace_wayland(environment)
+        if environment.get("WAYLAND_DISPLAY") or environment.get("DISPLAY"):
+            os.execvpe(command[0], command, environment)
+
+    # Explicit `--xr` standalone immersive OpenXR mode (or headless console with no display)
     try:
         backend, library = runtime_details(environment)
     except CONTROL_ERRORS:
         backend, library = "other", None
-    hyperspace, directory = runtime_directory_for(environment, backend)
-    if directory:
+    _, directory = runtime_directory_for(environment, backend)
+    if directory and explicit_xr:
         environment["XDG_RUNTIME_DIR"] = os.environ["XDG_RUNTIME_DIR"] = directory
 
-    controller = None
-    if backend == "monado":
-        controller = Monado(NAME)
-    elif backend == "wivrn" and library:
-        controller = WiVRnControl(library, NAME)
-
-    options = arguments[: arguments.index("--")] if "--" in arguments else arguments
-    non_session_flags = {"--headless", "--window", "-h", "--help", "-V", "--version"}
-    runs_xr_session = options[:1] != ["ctl"] and not non_session_flags.intersection(options)
-
-    if runs_xr_session and environment.get("XR_SCENE_APPLICATION_SOCKET"):
+    if explicit_xr and environment.get("XR_SCENE_APPLICATION_SOCKET"):
         status_command = [exe, "ctl", '{"op":"status"}']
 
         def ready():
@@ -102,7 +137,7 @@ def launch(arguments):
         started = subprocess.run(
             ["xr-shell-session", "--launch-application", "xr-files"], env=environment
         )
-        if started.returncode or not arguments:
+        if started.returncode or arguments == ["--xr"]:
             return started.returncode
         deadline = time.monotonic() + 45
         while time.monotonic() < deadline:
@@ -111,23 +146,22 @@ def launch(arguments):
             time.sleep(0.15)
         raise RuntimeError("XR Files did not become ready after native foreground handoff")
 
-    if controller and runs_xr_session:
+    controller = None
+    if backend == "monado":
+        controller = Monado(NAME)
+    elif backend == "wivrn" and library:
+        controller = WiVRnControl(library, NAME)
+
+    if controller:
         try:
             clients = controller.clients()
         except CONTROL_ERRORS:
             controller = None
-    else:
-        controller = None
 
     if controller is None:
-        # When inside HyperSpace private Wayland without multi-client XR session handoff,
-        # run in interactive wgpu Wayland window mode so it coexists with xr-shell.
-        if hyperspace and runs_xr_session and "--xr" not in options:
-            window_cmd = [exe, "--window", *arguments]
-            os.execvpe(window_cmd[0], window_cmd, environment)
         os.execvpe(command[0], command, environment)
 
-    xr_cmd = [exe, "--xr", *arguments] if "--xr" not in options else command
+    xr_cmd = [exe, "--xr", *arguments] if not explicit_xr else command
     previous = next((c for c in clients if c.flags & PRIMARY and c.flags & ACTIVE), None)
     existing = files_client(clients)
     child = subprocess.Popen(xr_cmd, env=environment)

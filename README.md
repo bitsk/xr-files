@@ -1,6 +1,6 @@
 # 空间文件 (xr-files)
 
-openKylin XR 的原生三维空间文件管理器，用于替代传统 2D 平面文件管理器（如 Peony）。基于 **Rust + wgpu (Vulkan / WGSL) + 跨架构硬件 SIMD** 构建，支持原生 OpenXR 双目立体会话、HyperSpace 空间桌面 Wayland 窗口协同以及无头离屏立体校验模式。
+openKylin XR 的原生三维空间文件管理器，用于替代传统 2D 平面文件管理器（如 Peony）。基于 **Rust + wgpu (Vulkan / WGSL) + 跨架构硬件 SIMD** 构建，**默认作为空间桌面窗口与 HyperSpace (`xr-shell` + `xr-window-server`) 共存**——保留晴空全景背景、三岛式空间 Dock 栏与其他应用窗口，并直接复用 HyperSpace 统一的空间拖动、双柄/边角缩放、柱面弯折（`curve`）、最小化与关闭交互；同时保留显式 `--xr` 独立 OpenXR 双目会话与 `--headless` 离屏校验模式。
 
 ![空间文件的弧面景深工作台渲染预览](docs/spatial-workbench-preview.png)
 
@@ -43,9 +43,10 @@ python3 ../xr-image-tools/tools/components.py build --profile files --output /tm
 ## 运行与智能控制接口 v1
 
 ```sh
-xr-files                          # 自动检测 OpenXR 头显会话或回退至桌面窗口模式
-xr-files --xr ~/Documents         # 强制以原生 OpenXR 立体空间模式打开目录
-xr-files --window --treemap ~     # 在桌面/xr-wayland 窗口中打开 3D 体积星图
+xr-files                          # 默认与 HyperSpace 空间桌面 (xr-wayland) 或桌面窗口共存
+xr-files --window ~/Documents     # 强制以空间桌面共存面板模式运行 (GPU 渲染 -> wl_shm Argb8888 预乘透明合成)
+xr-files --xr ~/Documents         # 显式以独立前景 OpenXR 双目立体会话运行 (含 BLEND_TEXTURE_SOURCE_ALPHA)
+xr-files --treemap ~              # 启动时直接进入 3D 体积星图视图
 xr-files --headless --capture-dir /tmp/xr-files-cap
 ```
 

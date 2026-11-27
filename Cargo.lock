@@ -2464,6 +2464,8 @@ dependencies = [
  "pollster",
  "serde",
  "serde_json",
+ "wayland-client",
+ "wayland-protocols",
  "wgpu",
  "winit",
 ]

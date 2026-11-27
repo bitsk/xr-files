@@ -189,3 +189,66 @@ fn control_socket_executes_search_mkdir_view_and_undo() {
     drop(server);
     let _ = fs::remove_dir_all(&tmp);
 }
+
+#[test]
+fn embedded_wayland_argb8888_preserves_transparent_sky_gap_and_premultiplied_invariants() {
+    let tmp = env::temp_dir().join(format!(
+        "xr-files-wl-test-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(tmp.join("全景目录")).unwrap();
+    fs::write(
+        tmp.join("prism.obj"),
+        "v 0 1 0\nv 1 0 0\nv 0 0 1\nv -1 0 0\nf 1 2 3\nf 1 3 4\n",
+    )
+    .unwrap();
+
+    let mut app = SpatialFilesApp::new(Some(tmp.join("prism.obj")));
+    app.set_embedded_panel(true);
+    std::thread::sleep(Duration::from_millis(60));
+
+    let mut renderer = WgpuSpatialRenderer::new_headless().expect("headless wgpu");
+    let mut glyphs = GlyphAtlas::new();
+    let (w, h) = (640u32, 300u32);
+    let eye = SpatialFilesApp::embedded_eye(w, h);
+    let scene = app.step_and_build_scene(&[eye, eye], &Default::default(), &mut glyphs);
+    renderer.sync_textures(
+        &mut glyphs,
+        &mut app.pending_gpu_thumbs,
+        &mut app.pending_gpu_inspect_image,
+    );
+
+    let mut argb = vec![0u8; (w * h * 4) as usize];
+    renderer
+        .render_offscreen_wayland_argb8888(w, h, eye, &scene, &mut argb)
+        .expect("render wayland argb8888");
+
+    let mut transparent_px = 0usize;
+    let mut visible_px = 0usize;
+    for px in argb.chunks_exact(4) {
+        let (b, g, r, a) = (px[0], px[1], px[2], px[3]);
+        assert!(
+            b <= a && g <= a && r <= a,
+            "premultiplied Argb8888 invariant violated: B={b} G={g} R={r} A={a}"
+        );
+        if a == 0 {
+            transparent_px += 1;
+        } else {
+            visible_px += 1;
+        }
+    }
+    assert!(
+        transparent_px > 2_000,
+        "embedded panel must leave transparent margins/gap for HyperSpace sky & Dock (got {transparent_px})"
+    );
+    assert!(
+        visible_px > 80_000,
+        "embedded panel must render rich two-pane spatial workbench & preview (got {visible_px})"
+    );
+
+    let _ = fs::remove_dir_all(&tmp);
+}

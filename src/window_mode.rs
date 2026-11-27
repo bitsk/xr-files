@@ -23,6 +23,7 @@ use winit::{
 };
 
 pub fn run_window(app: &mut SpatialFilesApp, control: Option<&ControlServer>) -> Result<()> {
+    app.set_embedded_panel(true);
     let event_loop = EventLoop::new().context("创建 Wayland/X11 事件循环失败")?;
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut state = WindowRunner::new(app, control);
@@ -78,12 +79,13 @@ impl<'a> WindowRunner<'a> {
     fn initialize_gpu(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
         let attrs = WindowAttributes::default()
             .with_title("空间文件 · openKylin XR Files")
-            .with_inner_size(PhysicalSize::new(1440, 860));
+            .with_inner_size(PhysicalSize::new(1560, 720));
         let window = Arc::new(event_loop.create_window(attrs)?);
         let size = window.inner_size();
 
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
+            flags: wgpu::InstanceFlags::ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER,
             ..Default::default()
         });
         let surface = instance.create_surface(Arc::clone(&window))?;
@@ -170,14 +172,7 @@ impl<'a> WindowRunner<'a> {
 
         let w = gpu.config.width.max(1);
         let h = gpu.config.height.max(1);
-        let aspect = (w as f32 / h as f32).clamp(0.5, 3.5);
-        let half_v = 33.0f32.to_radians();
-        let half_h = (half_v.tan() * aspect).atan();
-        let eye = EyeView {
-            position: [0.0, 1.60, 0.0],
-            orientation: quat_from_yaw_pitch(self.cam_yaw, self.cam_pitch),
-            fov: [-half_h, half_h, half_v, -half_v],
-        };
+        let eye = SpatialFilesApp::embedded_eye(w, h);
 
         let ndc_x = (self.cursor_px[0] / w as f32) * 2.0 - 1.0;
         let ndc_y = 1.0 - (self.cursor_px[1] / h as f32) * 2.0;

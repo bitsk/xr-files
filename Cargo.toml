@@ -17,6 +17,8 @@ openxr = "=0.22.0"
 pollster = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
 wgpu = { version = "24.0", default-features = false, features = ["wgc", "wgsl"] }
 winit = { version = "0.30", default-features = false, features = ["rwh_06", "wayland", "wayland-dlopen", "x11"] }
 

@@ -52,7 +52,7 @@ pub struct InspectorPreview {
 }
 
 enum PreviewJob {
-    Thumbnail(PathBuf),
+    Thumbnail { path: PathBuf, kind: FileKind },
     Inspect { path: PathBuf, kind: FileKind },
 }
 
@@ -94,8 +94,8 @@ impl AsyncPreviewer {
     }
 
     pub fn request_thumbnail(&mut self, entry: &FileEntry) {
-        if entry.kind != FileKind::Image
-            || entry.size > 32 * 1024 * 1024
+        if entry.kind == FileKind::Directory
+            || (entry.kind == FileKind::Image && entry.size > 32 * 1024 * 1024)
             || self.thumb_cache.contains_key(&entry.path)
             || self.pending_thumbs.contains(&entry.path)
             || self.failed_thumbs.contains(&entry.path)
@@ -106,7 +106,10 @@ impl AsyncPreviewer {
             return;
         }
         self.pending_thumbs.insert(entry.path.clone());
-        let _ = self.tx.send(PreviewJob::Thumbnail(entry.path.clone()));
+        let _ = self.tx.send(PreviewJob::Thumbnail {
+            path: entry.path.clone(),
+            kind: entry.kind,
+        });
     }
 
     pub fn request_inspect(&mut self, entry: &FileEntry) {
@@ -153,8 +156,8 @@ impl AsyncPreviewer {
 fn worker_loop(rx: Receiver<PreviewJob>, tx: Sender<PreviewResult>) {
     while let Ok(job) = rx.recv() {
         let reply = match job {
-            PreviewJob::Thumbnail(path) => {
-                let image = decode_scaled_rgba_mips(&path, 128).ok();
+            PreviewJob::Thumbnail { path, kind } => {
+                let image = build_rich_card_thumbnail(&path, kind, 160);
                 PreviewResult::Thumbnail { path, image }
             }
             PreviewJob::Inspect { path, kind } => {
@@ -164,6 +167,307 @@ fn worker_loop(rx: Receiver<PreviewJob>, tx: Sender<PreviewResult>) {
         if tx.send(reply).is_err() {
             break;
         }
+    }
+}
+
+/// Builds a rich visual `edge × edge` mipmapped card preview for Images, Videos, 3D Models, and Docs/Code.
+fn build_rich_card_thumbnail(path: &Path, kind: FileKind, edge: u32) -> Option<MipmappedRgba> {
+    match kind {
+        FileKind::Image => decode_scaled_rgba_mips(path, edge).ok(),
+        FileKind::Model3D => render_mesh_studio_thumbnail(path, edge).ok(),
+        FileKind::Video => Some(render_video_cinema_poster(path, edge)),
+        FileKind::Code | FileKind::Document => render_document_page_thumbnail(path, kind, edge).ok(),
+        FileKind::Archive | FileKind::Audio | FileKind::Executable | FileKind::Other => {
+            Some(render_scenic_asset_card(path, kind, edge))
+        }
+        FileKind::Directory => None,
+    }
+}
+
+fn hash_seed(path: &Path) -> u32 {
+    let mut h = 2166136261u32;
+    for &b in path.to_string_lossy().as_bytes() {
+        h ^= b as u32;
+        h = h.wrapping_mul(16777619);
+    }
+    h
+}
+
+/// Renders a widescreen cinema horizon / planetary poster with frosted glass play emblem for video files.
+fn render_video_cinema_poster(path: &Path, edge: u32) -> MipmappedRgba {
+    let seed = hash_seed(path);
+    let hue_shift = ((seed & 0xff) as f32) / 255.0;
+    let mut raw = vec![0u8; (edge * edge * 4) as usize];
+
+    for y in 0..edge {
+        let v = y as f32 / edge as f32;
+        for x in 0..edge {
+            let u = x as f32 / edge as f32;
+            // Atmospheric twilight sky + glowing planetary arc + ocean reflection
+            let dx = u - (0.62 - 0.24 * hue_shift);
+            let dy = v - 0.40;
+            let planet_r = (dx * dx + dy * dy).sqrt();
+
+            let mut r = 0.14 + 0.42 * (1.0 - v).powf(1.3) + 0.18 * hue_shift;
+            let mut g = 0.30 + 0.46 * (1.0 - (v - 0.48).abs() * 1.6).max(0.0);
+            let mut b = 0.64 + 0.34 * (1.0 - v * 0.5);
+
+            // Glowing planet / VR180 sphere + atmospheric crescent rim
+            if planet_r < 0.26 {
+                let shade = ((dx + 0.12) * 2.8 - dy * 2.2).clamp(0.08, 1.0);
+                let rim = (planet_r / 0.26).powf(4.0) * 0.55;
+                r = 0.22 + 0.58 * shade + rim;
+                g = 0.46 + 0.42 * shade + rim;
+                b = 0.88 + 0.12 * shade + rim * 0.5;
+            } else if planet_r < 0.33 {
+                let glow = (1.0 - (planet_r - 0.26) / 0.07).powi(2) * 0.45;
+                r += glow * 0.55;
+                g += glow * 0.78;
+                b += glow * 1.00;
+            }
+
+            // Soft horizon silk wave
+            let wave = 0.58 + 0.04 * (u * 7.5 + hue_shift * 5.0).sin();
+            if v > wave {
+                let wt = ((v - wave) / (1.0 - wave)).clamp(0.0, 1.0);
+                let ripple = 0.04 * (v * 48.0 + u * 9.0).sin() * (1.0 - wt);
+                r = r * 0.78 + 0.14 + ripple;
+                g = g * 0.84 + 0.16 + ripple;
+                b = (b * 0.92 + 0.10 + ripple).min(1.0);
+            }
+
+            // Frosted translucent center play circle + crisp white play triangle
+            let cx = u - 0.5;
+            let cy = v - 0.5;
+            let cr = (cx * cx + cy * cy).sqrt();
+            if cr < 0.18 {
+                r = r * 0.45 + 0.52;
+                g = g * 0.45 + 0.53;
+                b = b * 0.45 + 0.55;
+                let px = cx - 0.015;
+                let py = cy;
+                if px > -0.055 && 0.5 * px + 0.866 * py < 0.048 && 0.5 * px - 0.866 * py < 0.048 {
+                    r = 1.0;
+                    g = 1.0;
+                    b = 1.0;
+                }
+            }
+
+            let idx = ((y * edge + x) * 4) as usize;
+            raw[idx] = (r.clamp(0.0, 1.0) * 255.0) as u8;
+            raw[idx + 1] = (g.clamp(0.0, 1.0) * 255.0) as u8;
+            raw[idx + 2] = (b.clamp(0.0, 1.0) * 255.0) as u8;
+            raw[idx + 3] = 255;
+        }
+    }
+    simd::premultiply_rgba_in_place(&mut raw);
+    MipmappedRgba {
+        mips: simd::generate_mip_chain_rgba(raw, edge, edge),
+        original_dimensions: [1920, 1080],
+    }
+}
+
+/// Software-rasterizes a smooth shaded 3D studio preview of an `.obj` / `.stl` / `.glb` mesh!
+fn render_mesh_studio_thumbnail(path: &Path, edge: u32) -> Result<MipmappedRgba> {
+    let mesh = load_3d_mesh_preview(path)?;
+    let mut raw = vec![0u8; (edge * edge * 4) as usize];
+    let mut zbuf = vec![f32::INFINITY; (edge * edge) as usize];
+
+    // Soft Qingkong studio sky backdrop + subtle ground reflection disc
+    for y in 0..edge {
+        let v = y as f32 / edge as f32;
+        for x in 0..edge {
+            let u = x as f32 / edge as f32;
+            let rad = ((u - 0.5).powi(2) + (v - 0.55).powi(2)).sqrt();
+            let glow = (1.0 - rad * 1.15).clamp(0.0, 1.0);
+            let r = 0.78 + 0.20 * glow;
+            let g = 0.87 + 0.12 * glow;
+            let b = 0.98 + 0.02 * glow;
+            let idx = ((y * edge + x) * 4) as usize;
+            raw[idx] = (r * 255.0) as u8;
+            raw[idx + 1] = (g * 255.0) as u8;
+            raw[idx + 2] = (b * 255.0) as u8;
+            raw[idx + 3] = 255;
+        }
+    }
+
+    let yaw = 0.62f32;
+    let pitch = 0.36f32;
+    let (sy, cy) = yaw.sin_cos();
+    let (sp, cp) = pitch.sin_cos();
+    let rot = |p: [f32; 3]| -> [f32; 3] {
+        let x1 = p[0] * cy + p[2] * sy;
+        let z1 = -p[0] * sy + p[2] * cy;
+        let y2 = p[1] * cp - z1 * sp;
+        let z2 = p[1] * sp + z1 * cp;
+        [x1, y2, z2]
+    };
+
+    let scale = edge as f32 * 0.74;
+    let half = edge as f32 * 0.5;
+    for tri in mesh.vertices.chunks_exact(3) {
+        let v0 = rot(tri[0].position);
+        let v1 = rot(tri[1].position);
+        let v2 = rot(tri[2].position);
+        let n = rot(tri[0].normal);
+
+        let s0 = [half + v0[0] * scale, half - v0[1] * scale, 2.0 - v0[2]];
+        let s1 = [half + v1[0] * scale, half - v1[1] * scale, 2.0 - v1[2]];
+        let s2 = [half + v2[0] * scale, half - v2[1] * scale, 2.0 - v2[2]];
+
+        let min_x = s0[0].min(s1[0]).min(s2[0]).floor().max(0.0) as u32;
+        let max_x = s0[0].max(s1[0]).max(s2[0]).ceil().min((edge - 1) as f32) as u32;
+        let min_y = s0[1].min(s1[1]).min(s2[1]).floor().max(0.0) as u32;
+        let max_y = s0[1].max(s1[1]).max(s2[1]).ceil().min((edge - 1) as f32) as u32;
+
+        let area = (s1[0] - s0[0]) * (s2[1] - s0[1]) - (s1[1] - s0[1]) * (s2[0] - s0[0]);
+        if area.abs() < 1e-4 {
+            continue;
+        }
+        let inv_area = 1.0 / area;
+
+        let nl = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1e-5);
+        let nn = [n[0] / nl, n[1] / nl, n[2] / nl];
+        let sun = (-0.45 * nn[0] + 0.75 * nn[1] + 0.48 * nn[2]).abs();
+        let col = [
+            (0.24 + 0.52 * sun).clamp(0.0, 1.0),
+            (0.46 + 0.46 * sun).clamp(0.0, 1.0),
+            (0.88 + 0.12 * sun).clamp(0.0, 1.0),
+        ];
+
+        for py in min_y..=max_y {
+            for px in min_x..=max_x {
+                let p = [px as f32 + 0.5, py as f32 + 0.5];
+                let w0 = ((s1[0] - p[0]) * (s2[1] - p[1]) - (s1[1] - p[1]) * (s2[0] - p[0])) * inv_area;
+                let w1 = ((s2[0] - p[0]) * (s0[1] - p[1]) - (s2[1] - p[1]) * (s0[0] - p[0])) * inv_area;
+                let w2 = 1.0 - w0 - w1;
+                if w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0 {
+                    let z = w0 * s0[2] + w1 * s1[2] + w2 * s2[2];
+                    let zi = (py * edge + px) as usize;
+                    if z < zbuf[zi] {
+                        zbuf[zi] = z;
+                        raw[zi * 4] = (col[0] * 255.0) as u8;
+                        raw[zi * 4 + 1] = (col[1] * 255.0) as u8;
+                        raw[zi * 4 + 2] = (col[2] * 255.0) as u8;
+                    }
+                }
+            }
+        }
+    }
+
+    simd::premultiply_rgba_in_place(&mut raw);
+    Ok(MipmappedRgba {
+        mips: simd::generate_mip_chain_rgba(raw, edge, edge),
+        original_dimensions: [edge, edge],
+    })
+}
+
+/// Renders a miniature document/code page preview from actual lines of the file!
+fn render_document_page_thumbnail(path: &Path, kind: FileKind, edge: u32) -> Result<MipmappedRgba> {
+    let mut sample = Vec::with_capacity(4096);
+    if let Ok(f) = File::open(path) {
+        let _ = f.take(4096).read_to_end(&mut sample);
+    }
+    let text = String::from_utf8_lossy(&sample);
+    let lines: Vec<&str> = text.lines().take(12).collect();
+
+    let is_code = kind == FileKind::Code;
+    let mut raw = vec![0u8; (edge * edge * 4) as usize];
+
+    for y in 0..edge {
+        let v = y as f32 / edge as f32;
+        for x in 0..edge {
+            let u = x as f32 / edge as f32;
+            let paper_shade = 0.012 * u;
+            let mut rgb = if is_code {
+                [0.92f32 - paper_shade, 0.955 - paper_shade, 0.995]
+            } else {
+                [0.985f32 - paper_shade, 0.975 - paper_shade, 0.96]
+            };
+            // Top colorful banner header on miniature page
+            if v < 0.22 {
+                rgb = if is_code {
+                    [0.24, 0.56, 0.96]
+                } else {
+                    [0.98, 0.54, 0.20]
+                };
+            }
+            let idx = ((y * edge + x) * 4) as usize;
+            raw[idx] = (rgb[0] * 255.0) as u8;
+            raw[idx + 1] = (rgb[1] * 255.0) as u8;
+            raw[idx + 2] = (rgb[2] * 255.0) as u8;
+            raw[idx + 3] = 255;
+        }
+    }
+
+    // Draw crisp miniature syntax/paragraph bars representing real line lengths!
+    for (row, line) in lines.iter().enumerate().take(8) {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let indent = (line.len() - trimmed.len()).min(12) as u32 * 4;
+        let bar_w = ((trimmed.chars().count().min(36) as f32 / 36.0) * (edge as f32 * 0.72))
+            .max(14.0) as u32;
+        let y0 = (edge * 30 / 100) + (row as u32) * (edge * 8 / 100);
+        let y1 = (y0 + (edge * 4 / 100).max(3)).min(edge - 4);
+        let x0 = (edge * 12 / 100 + indent).min(edge - 8);
+        let x1 = (x0 + bar_w).min(edge - 10);
+
+        let bar_col: [u8; 3] = if trimmed.starts_with('#') || trimmed.starts_with("pub ") || trimmed.starts_with("fn ") {
+            [55, 136, 246]
+        } else if is_code {
+            [72, 96, 132]
+        } else {
+            [96, 108, 128]
+        };
+        for py in y0..y1 {
+            for px in x0..x1 {
+                let idx = ((py * edge + px) * 4) as usize;
+                raw[idx..idx + 3].copy_from_slice(&bar_col);
+            }
+        }
+    }
+
+    simd::premultiply_rgba_in_place(&mut raw);
+    Ok(MipmappedRgba {
+        mips: simd::generate_mip_chain_rgba(raw, edge, edge),
+        original_dimensions: [edge, edge],
+    })
+}
+
+fn render_scenic_asset_card(path: &Path, kind: FileKind, edge: u32) -> MipmappedRgba {
+    let seed = hash_seed(path);
+    let phase = ((seed & 0xff) as f32) * 0.025;
+    let mut raw = vec![0u8; (edge * edge * 4) as usize];
+    for y in 0..edge {
+        let v = y as f32 / edge as f32;
+        for x in 0..edge {
+            let u = x as f32 / edge as f32;
+            let wave = (u * 4.5 + phase).sin() * 0.08 + (v * 3.0).cos() * 0.05;
+            let (r, g, b) = match kind {
+                FileKind::Archive => (
+                    0.98 - 0.12 * v + wave * 0.2,
+                    0.82 - 0.18 * v + wave * 0.2,
+                    0.46 + 0.18 * u,
+                ),
+                _ => (
+                    0.76 + 0.18 * u + wave,
+                    0.86 + 0.10 * (1.0 - v) + wave,
+                    0.99,
+                ),
+            };
+            let idx = ((y * edge + x) * 4) as usize;
+            raw[idx] = (r.clamp(0.0, 1.0) * 255.0) as u8;
+            raw[idx + 1] = (g.clamp(0.0, 1.0) * 255.0) as u8;
+            raw[idx + 2] = (b.clamp(0.0, 1.0) * 255.0) as u8;
+            raw[idx + 3] = 255;
+        }
+    }
+    simd::premultiply_rgba_in_place(&mut raw);
+    MipmappedRgba {
+        mips: simd::generate_mip_chain_rgba(raw, edge, edge),
+        original_dimensions: [edge, edge],
     }
 }
 
@@ -207,7 +511,7 @@ pub fn build_inspector_preview(path: &Path, kind: FileKind) -> InspectorPreview 
             ],
             image: None,
             mesh: None,
-            summary_note: format!("目录 · 共 {count} 个直接子项"),
+            summary_note: format!("{count}"),
         };
     }
 
@@ -217,10 +521,11 @@ pub fn build_inspector_preview(path: &Path, kind: FileKind) -> InspectorPreview 
     }
     let inspection = simd::inspect_bytes_simd(&sample);
 
-    let image = if kind == FileKind::Image {
-        decode_scaled_rgba_mips(path, 384).ok()
-    } else {
-        None
+    let image = match kind {
+        FileKind::Image => decode_scaled_rgba_mips(path, 384).ok(),
+        FileKind::Video => Some(render_video_cinema_poster(path, 384)),
+        FileKind::Code | FileKind::Document => render_document_page_thumbnail(path, kind, 384).ok(),
+        _ => None,
     };
 
     let mesh = if kind == FileKind::Model3D {
@@ -279,22 +584,22 @@ pub fn build_inspector_preview(path: &Path, kind: FileKind) -> InspectorPreview 
     };
 
     let summary_note = if let Some(ref m) = mesh {
-        format!("{} · {} 三角面", m.format_label, m.triangle_count)
-    } else if let Some(ref img) = image {
+        format!("{} △", m.triangle_count)
+    } else if kind == FileKind::Image {
+        if let Some(ref img) = image {
+            format!("{}×{}", img.original_dimensions[0], img.original_dimensions[1])
+        } else {
+            String::new()
+        }
+    } else if kind == FileKind::Video {
+        "VR / 2D".into()
+    } else if !inspection.is_likely_binary {
         format!(
-            "图像 {}×{} · {} 级 Mip",
-            img.original_dimensions[0],
-            img.original_dimensions[1],
-            img.mips.len()
+            "{}L",
+            inspection.newline_count + usize::from(!sample.is_empty())
         )
-    } else if inspection.is_likely_binary {
-        format!("二进制数据 · 熵 {:.2} bits/B", inspection.entropy_bits)
     } else {
-        format!(
-            "文本 {} 行(采样) · 熵 {:.2} bits/B",
-            inspection.newline_count + usize::from(!sample.is_empty()),
-            inspection.entropy_bits
-        )
+        String::new()
     };
 
     InspectorPreview {

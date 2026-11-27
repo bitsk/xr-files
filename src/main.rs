@@ -63,6 +63,7 @@ fn main() -> Result<()> {
 
     let mut mode = RunMode::Auto;
     let mut initial_treemap = false;
+    let mut initial_search: Option<String> = None;
     let mut max_seconds: Option<u64> = None;
     let mut capture_dir: Option<PathBuf> = None;
     let mut initial_path: Option<PathBuf> = None;
@@ -85,6 +86,12 @@ fn main() -> Result<()> {
             "--window" => mode = RunMode::Window,
             "--headless" => mode = RunMode::Headless,
             "--treemap" => initial_treemap = true,
+            "--search" => {
+                let raw = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--search 需要查询词参数"))?;
+                initial_search = Some(raw);
+            }
             "--seconds" => {
                 let raw = args
                     .next()
@@ -116,6 +123,9 @@ fn main() -> Result<()> {
     let mut app = SpatialFilesApp::new(initial_path);
     if initial_treemap {
         app.set_view_mode(ViewMode::Treemap3D);
+    }
+    if let Some(q) = initial_search {
+        app.set_search_query(q);
     }
 
     let ctl = ControlServer::bind_default().ok();
@@ -204,7 +214,8 @@ fn run_headless(
         let pair = renderer.render_stereo_offscreen_rgba(width, height, &eyes, &scene)?;
         app.submitted_frames += 1;
 
-        if app.shutdown_requested() || (duration.is_zero() && app.submitted_frames >= 3) {
+        let min_frames = if capture_dir.is_some() { 14 } else { 3 };
+        if app.shutdown_requested() || (duration.is_zero() && app.submitted_frames >= min_frames) {
             break pair;
         }
         if !duration.is_zero() && started.elapsed() >= duration {

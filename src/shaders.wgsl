@@ -248,6 +248,16 @@ fn fs_quad(in: QuadVertexOut) -> @location(0) vec4<f32> {
         return vec4<f32>(thumb_s.rgb * in.fill_color.rgb * in.fill_color.a * outer_cov, a);
     }
 
+    // 3b. Monochrome tintable vector SDF UI icon (`tex_kind == 5`, linear-alpha coverage)
+    if tex_kind == 5 {
+        let cov = thumb_s.a * outer_cov;
+        let a = cov * in.fill_color.a;
+        if a < 0.003 {
+            discard;
+        }
+        return vec4<f32>(in.fill_color.rgb * a, a);
+    }
+
     // 4. High-res Inspector image (`tex_kind == 3`)
     if tex_kind == 3 {
         let a = insp_s.a * in.fill_color.a * outer_cov;

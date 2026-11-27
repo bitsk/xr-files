@@ -399,13 +399,25 @@ fn create_wgpu_on_openxr_vulkan(
         let loader_ver = vk_entry
             .try_enumerate_instance_version()?
             .unwrap_or(vk::API_VERSION_1_1);
-        let target_api = vk::make_api_version(
+        let runtime_max_api = vk::make_api_version(
             0,
-            reqs.min_api_version_supported.major().max(1) as u32,
-            reqs.min_api_version_supported.minor().max(1) as u32,
+            reqs.max_api_version_supported.major() as u32,
+            reqs.max_api_version_supported.minor() as u32,
             0,
-        )
-        .min(loader_ver);
+        );
+        // wgpu uses promoted core entry points on modern devices. Request the
+        // highest mutually supported version instead of the runtime's minimum.
+        let target_api = loader_ver.min(runtime_max_api).min(vk::API_VERSION_1_3);
+        let runtime_min_api = vk::make_api_version(
+            0,
+            reqs.min_api_version_supported.major() as u32,
+            reqs.min_api_version_supported.minor() as u32,
+            0,
+        );
+        ensure!(
+            target_api >= runtime_min_api.max(vk::API_VERSION_1_1),
+            "OpenXR 与 Vulkan 加载器没有兼容的 Vulkan 1.1+ 版本"
+        );
 
         let flags = wgpu::InstanceFlags::ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER;
         let desired_inst_exts =

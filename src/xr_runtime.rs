@@ -413,7 +413,8 @@ fn create_wgpu_on_openxr_vulkan(
                 &vk_entry, target_api, flags,
             )
             .unwrap_or_default();
-        let inst_ext_ptrs: Vec<*const i8> = desired_inst_exts.iter().map(|s| s.as_ptr()).collect();
+        let inst_ext_ptrs: Vec<*const std::ffi::c_char> =
+            desired_inst_exts.iter().map(|s| s.as_ptr()).collect();
 
         let app_info = vk::ApplicationInfo::default()
             .application_name(c"openKylin XR Files")
@@ -463,7 +464,8 @@ fn create_wgpu_on_openxr_vulkan(
 
         let features = wgpu::Features::empty();
         let enabled_dev_exts = exposed.adapter.required_device_extensions(features);
-        let dev_ext_ptrs: Vec<*const i8> = enabled_dev_exts.iter().map(|s| s.as_ptr()).collect();
+        let dev_ext_ptrs: Vec<*const std::ffi::c_char> =
+            enabled_dev_exts.iter().map(|s| s.as_ptr()).collect();
         let mut enabled_phd_features = exposed
             .adapter
             .physical_device_features(&enabled_dev_exts, features);

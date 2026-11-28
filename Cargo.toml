@@ -1,12 +1,13 @@
 [package]
 name = "xr-files"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 rust-version = "1.88"
 license = "GPL-3.0-or-later"
 description = "3D spatial file manager for the openKylin XR desktop (Rust / wgpu / SIMD)"
 
 [dependencies]
+xr-shell-protocols = { version = "=0.2.0", path = "../xr-shell/protocols" }
 anyhow = "1"
 ab_glyph = "0.2"
 ash = { version = "0.38", default-features = false, features = ["loaded", "debug", "std"] }

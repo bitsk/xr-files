@@ -18,9 +18,9 @@ use bytemuck::{Pod, Zeroable};
 use std::{env, path::Path};
 use wgpu::util::DeviceExt;
 
-pub const THUMB_SIZE: u32 = 128;
+pub const THUMB_SIZE: u32 = 256;
 pub const THUMB_LAYERS: u32 = 96;
-pub const INSPECT_TEX_SIZE: u32 = 384;
+pub const INSPECT_TEX_SIZE: u32 = 512;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]

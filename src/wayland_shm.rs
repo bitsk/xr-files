@@ -39,8 +39,8 @@ use wayland_protocols::xdg::{
     shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base},
 };
 
-const DEFAULT_WIDTH: u32 = 1560;
-const DEFAULT_HEIGHT: u32 = 720;
+const DEFAULT_WIDTH: u32 = 1600;
+const DEFAULT_HEIGHT: u32 = 900;
 
 const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
@@ -206,7 +206,7 @@ struct WaylandState {
     pointer_inside: bool,
     cursor_px: [f32; 2],
     left_down: bool,
-    right_just_clicked: bool,
+    right_down: bool,
     back_just_clicked: bool,
     scroll_stick_y: f32,
     ctrl_down: bool,
@@ -238,7 +238,7 @@ impl WaylandState {
             pointer_inside: false,
             cursor_px: [DEFAULT_WIDTH as f32 * 0.5, DEFAULT_HEIGHT as f32 * 0.5],
             left_down: false,
-            right_just_clicked: false,
+            right_down: false,
             back_just_clicked: false,
             scroll_stick_y: 0.0,
             ctrl_down: false,
@@ -414,7 +414,7 @@ pub fn run_wayland_shm(
 
             let hand0 = if state.pointer_inside
                 || state.left_down
-                || state.right_just_clicked
+                || state.right_down
                 || state.back_just_clicked
                 || state.scroll_stick_y.abs() > 0.01
             {
@@ -431,7 +431,7 @@ pub fn run_wayland_shm(
                     aim_dir: ray_dir,
                     trigger_pressed: state.left_down,
                     squeeze_pressed: false,
-                    secondary_just_pressed: std::mem::replace(&mut state.right_just_clicked, false),
+                    secondary_pressed: state.right_down,
                     back_just_pressed: std::mem::replace(&mut state.back_just_clicked, false),
                     thumb_click_just_pressed: false,
                     stick: [0.0, std::mem::replace(&mut state.scroll_stick_y, 0.0)],
@@ -456,6 +456,11 @@ pub fn run_wayland_shm(
             renderer.render_offscreen_wayland_argb8888(w, h, eye, &scene, dst_bytes)?;
 
             let wl_surf = state.surface.as_ref().unwrap();
+            state
+                .xdg_surface
+                .as_ref()
+                .unwrap()
+                .set_window_geometry(0, 0, w as i32, h as i32);
             wl_surf.attach(Some(wl_buf), 0, 0);
             wl_surf.damage_buffer(0, 0, w as i32, h as i32);
             wl_surf.commit();
@@ -515,8 +520,9 @@ fn apply_evdev_key(app: &mut SpatialFilesApp, key: u32, ctrl: bool, shift: bool)
     }
 
     match key {
-        1 => app.cancel_modals(),     // KEY_ESC
-        14 => app.handle_backspace(), // KEY_BACKSPACE
+        1 => app.cancel_modals(),                                   // KEY_ESC
+        14 => app.handle_backspace(),                               // KEY_BACKSPACE
+        57 if app.prompt_mode.is_none() => app.toggle_quick_look(), // Space
         15 => {
             let next = match app.view_mode {
                 ViewMode::Workbench => ViewMode::Treemap3D,
@@ -524,15 +530,15 @@ fn apply_evdev_key(app: &mut SpatialFilesApp, key: u32, ctrl: bool, shift: bool)
             };
             app.set_view_mode(next);
         } // KEY_TAB
-        28 | 96 => app.commit_prompt(), // KEY_ENTER / KPENTER
+        28 | 96 => app.commit_prompt(),                             // KEY_ENTER / KPENTER
         60 => {
             if let Some(idx) = app.primary_selected {
                 app.prompt_mode = Some(PromptMode::Rename);
                 app.prompt_buffer = app.all_entries[idx].name.clone();
             }
         } // KEY_F2
-        104 => app.step_page(-1),     // KEY_PAGEUP
-        109 => app.step_page(1),      // KEY_PAGEDOWN
+        104 => app.step_page(-1),                                   // KEY_PAGEUP
+        109 => app.step_page(1),                                    // KEY_PAGEDOWN
         111 => {
             let _ = app.trash_or_restore_selected();
         } // KEY_DELETE
@@ -740,6 +746,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
             wl_pointer::Event::Leave { .. } => {
                 state.pointer_inside = false;
                 state.left_down = false;
+                state.right_down = false;
                 state.needs_redraw = true;
             }
             wl_pointer::Event::Motion {
@@ -759,11 +766,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
                 let down = btn_state == wl_pointer::ButtonState::Pressed;
                 match button {
                     BTN_LEFT => state.left_down = down,
-                    BTN_RIGHT | BTN_MIDDLE => {
-                        if down {
-                            state.right_just_clicked = true;
-                        }
-                    }
+                    BTN_RIGHT | BTN_MIDDLE => state.right_down = down,
                     BTN_SIDE | BTN_EXTRA => {
                         if down {
                             state.back_just_clicked = true;

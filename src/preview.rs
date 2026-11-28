@@ -54,6 +54,7 @@ pub struct InspectorPreview {
 enum PreviewJob {
     Thumbnail { path: PathBuf, kind: FileKind },
     Inspect { path: PathBuf, kind: FileKind },
+    DirectoryPeek { dir: PathBuf },
 }
 
 pub enum PreviewResult {
@@ -62,6 +63,10 @@ pub enum PreviewResult {
         image: Option<MipmappedRgba>,
     },
     Inspected(InspectorPreview),
+    DirectoryPeek {
+        dir: PathBuf,
+        entries: Vec<(PathBuf, FileKind)>,
+    },
 }
 
 pub struct AsyncPreviewer {
@@ -73,6 +78,8 @@ pub struct AsyncPreviewer {
     pub thumb_cache: HashMap<PathBuf, MipmappedRgba>,
     last_requested_inspect: Option<PathBuf>,
     pub active_inspect: Option<InspectorPreview>,
+    pub dir_peek_cache: HashMap<PathBuf, Vec<(PathBuf, FileKind)>>,
+    pending_dir_peeks: HashSet<PathBuf>,
 }
 
 impl AsyncPreviewer {
@@ -94,6 +101,8 @@ impl AsyncPreviewer {
             thumb_cache: HashMap::new(),
             last_requested_inspect: None,
             active_inspect: None,
+            dir_peek_cache: HashMap::new(),
+            pending_dir_peeks: HashSet::new(),
         }
     }
 
@@ -132,6 +141,16 @@ impl AsyncPreviewer {
         self.active_inspect = None;
     }
 
+    pub fn request_directory_peek(&mut self, dir: &Path) {
+        if self.dir_peek_cache.contains_key(dir) || self.pending_dir_peeks.contains(dir) {
+            return;
+        }
+        self.pending_dir_peeks.insert(dir.to_path_buf());
+        let _ = self.tx.send(PreviewJob::DirectoryPeek {
+            dir: dir.to_path_buf(),
+        });
+    }
+
     /// Polls completed background thumbnails and inspector data; returns newly arrived thumbnails.
     pub fn poll(&mut self) -> Vec<(PathBuf, MipmappedRgba)> {
         let mut new_thumbs = Vec::new();
@@ -151,6 +170,10 @@ impl AsyncPreviewer {
                         self.active_inspect = Some(preview);
                     }
                 }
+                PreviewResult::DirectoryPeek { dir, entries } => {
+                    self.pending_dir_peeks.remove(&dir);
+                    self.dir_peek_cache.insert(dir, entries);
+                }
             }
         }
         new_thumbs
@@ -161,11 +184,45 @@ fn worker_loop(rx: Receiver<PreviewJob>, tx: Sender<PreviewResult>, wake: crate:
     while let Ok(job) = rx.recv() {
         let reply = match job {
             PreviewJob::Thumbnail { path, kind } => {
-                let image = build_rich_card_thumbnail(&path, kind, 160);
+                let image = build_rich_card_thumbnail(&path, kind, 256);
                 PreviewResult::Thumbnail { path, image }
             }
             PreviewJob::Inspect { path, kind } => {
                 PreviewResult::Inspected(build_inspector_preview(&path, kind))
+            }
+            PreviewJob::DirectoryPeek { dir } => {
+                let mut entries =
+                    crate::fs_ops::read_location_entries(&dir.to_string_lossy(), false)
+                        .unwrap_or_default();
+                entries.sort_by_key(|e| {
+                    (
+                        match e.kind {
+                            FileKind::Image | FileKind::Model3D | FileKind::Video => 0,
+                            FileKind::Code | FileKind::Document => 1,
+                            _ => 2,
+                        },
+                        e.name.clone(),
+                    )
+                });
+                entries.truncate(3);
+                for entry in &entries {
+                    if entry.kind != FileKind::Directory && entry.size <= 32 * 1024 * 1024 {
+                        let image = build_rich_card_thumbnail(&entry.path, entry.kind, 256);
+                        if tx
+                            .send(PreviewResult::Thumbnail {
+                                path: entry.path.clone(),
+                                image,
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+                PreviewResult::DirectoryPeek {
+                    dir,
+                    entries: entries.into_iter().map(|e| (e.path, e.kind)).collect(),
+                }
             }
         };
         if tx.send(reply).is_err() {
@@ -181,7 +238,9 @@ fn build_rich_card_thumbnail(path: &Path, kind: FileKind, edge: u32) -> Option<M
         FileKind::Image => decode_scaled_rgba_mips(path, edge).ok(),
         FileKind::Model3D => render_mesh_studio_thumbnail(path, edge).ok(),
         FileKind::Video => Some(render_video_cinema_poster(path, edge)),
-        FileKind::Code | FileKind::Document => render_document_page_thumbnail(path, kind, edge).ok(),
+        FileKind::Code | FileKind::Document => {
+            render_document_page_thumbnail(path, kind, edge).ok()
+        }
         FileKind::Archive | FileKind::Audio | FileKind::Executable | FileKind::Other => {
             Some(render_scenic_asset_card(path, kind, edge))
         }
@@ -343,8 +402,10 @@ fn render_mesh_studio_thumbnail(path: &Path, edge: u32) -> Result<MipmappedRgba>
         for py in min_y..=max_y {
             for px in min_x..=max_x {
                 let p = [px as f32 + 0.5, py as f32 + 0.5];
-                let w0 = ((s1[0] - p[0]) * (s2[1] - p[1]) - (s1[1] - p[1]) * (s2[0] - p[0])) * inv_area;
-                let w1 = ((s2[0] - p[0]) * (s0[1] - p[1]) - (s2[1] - p[1]) * (s0[0] - p[0])) * inv_area;
+                let w0 =
+                    ((s1[0] - p[0]) * (s2[1] - p[1]) - (s1[1] - p[1]) * (s2[0] - p[0])) * inv_area;
+                let w1 =
+                    ((s2[0] - p[0]) * (s0[1] - p[1]) - (s2[1] - p[1]) * (s0[0] - p[0])) * inv_area;
                 let w2 = 1.0 - w0 - w1;
                 if w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0 {
                     let z = w0 * s0[2] + w1 * s1[2] + w2 * s2[2];
@@ -419,7 +480,10 @@ fn render_document_page_thumbnail(path: &Path, kind: FileKind, edge: u32) -> Res
         let x0 = (edge * 12 / 100 + indent).min(edge - 8);
         let x1 = (x0 + bar_w).min(edge - 10);
 
-        let bar_col: [u8; 3] = if trimmed.starts_with('#') || trimmed.starts_with("pub ") || trimmed.starts_with("fn ") {
+        let bar_col: [u8; 3] = if trimmed.starts_with('#')
+            || trimmed.starts_with("pub ")
+            || trimmed.starts_with("fn ")
+        {
             [55, 136, 246]
         } else if is_code {
             [72, 96, 132]
@@ -456,11 +520,7 @@ fn render_scenic_asset_card(path: &Path, kind: FileKind, edge: u32) -> Mipmapped
                     0.82 - 0.18 * v + wave * 0.2,
                     0.46 + 0.18 * u,
                 ),
-                _ => (
-                    0.76 + 0.18 * u + wave,
-                    0.86 + 0.10 * (1.0 - v) + wave,
-                    0.99,
-                ),
+                _ => (0.76 + 0.18 * u + wave, 0.86 + 0.10 * (1.0 - v) + wave, 0.99),
             };
             let idx = ((y * edge + x) * 4) as usize;
             raw[idx] = (r.clamp(0.0, 1.0) * 255.0) as u8;
@@ -527,9 +587,9 @@ pub fn build_inspector_preview(path: &Path, kind: FileKind) -> InspectorPreview 
     let inspection = simd::inspect_bytes_simd(&sample);
 
     let image = match kind {
-        FileKind::Image => decode_scaled_rgba_mips(path, 384).ok(),
-        FileKind::Video => Some(render_video_cinema_poster(path, 384)),
-        FileKind::Code | FileKind::Document => render_document_page_thumbnail(path, kind, 384).ok(),
+        FileKind::Image => decode_scaled_rgba_mips(path, 512).ok(),
+        FileKind::Video => Some(render_video_cinema_poster(path, 512)),
+        FileKind::Code | FileKind::Document => render_document_page_thumbnail(path, kind, 512).ok(),
         _ => None,
     };
 
@@ -592,7 +652,10 @@ pub fn build_inspector_preview(path: &Path, kind: FileKind) -> InspectorPreview 
         format!("{} △", m.triangle_count)
     } else if kind == FileKind::Image {
         if let Some(ref img) = image {
-            format!("{}×{}", img.original_dimensions[0], img.original_dimensions[1])
+            format!(
+                "{}×{}",
+                img.original_dimensions[0], img.original_dimensions[1]
+            )
         } else {
             String::new()
         }
@@ -766,9 +829,18 @@ fn parse_stl(bytes: &[u8]) -> Result<Vec<MeshVertex>> {
                 } else {
                     face_normal(p0, p1, p2)
                 };
-                out.push(MeshVertex { position: p0, normal: n });
-                out.push(MeshVertex { position: p1, normal: n });
-                out.push(MeshVertex { position: p2, normal: n });
+                out.push(MeshVertex {
+                    position: p0,
+                    normal: n,
+                });
+                out.push(MeshVertex {
+                    position: p1,
+                    normal: n,
+                });
+                out.push(MeshVertex {
+                    position: p2,
+                    normal: n,
+                });
             }
             return Ok(out);
         }
@@ -790,31 +862,45 @@ fn parse_stl(bytes: &[u8]) -> Result<Vec<MeshVertex>> {
     for tri in verts.chunks_exact(3).take(60_000) {
         let n = face_normal(tri[0], tri[1], tri[2]);
         for &p in tri {
-            out.push(MeshVertex { position: p, normal: n });
+            out.push(MeshVertex {
+                position: p,
+                normal: n,
+            });
         }
     }
     Ok(out)
 }
 
 fn parse_glb(bytes: &[u8]) -> Result<Vec<MeshVertex>> {
-    ensure!(bytes.len() >= 20 && &bytes[0..4] == b"glTF", "无效 GLB 魔数");
+    ensure!(
+        bytes.len() >= 20 && &bytes[0..4] == b"glTF",
+        "无效 GLB 魔数"
+    );
     let json_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
     let json_type = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
-    ensure!(json_type == 0x4E4F534A && 20 + json_len <= bytes.len(), "损坏的 GLB JSON 块");
+    ensure!(
+        json_type == 0x4E4F534A && 20 + json_len <= bytes.len(),
+        "损坏的 GLB JSON 块"
+    );
     let gltf: Value = serde_json::from_slice(&bytes[20..20 + json_len])?;
 
     let bin_offset = 20 + json_len;
     ensure!(bin_offset + 8 <= bytes.len(), "GLB 缺少二进制缓冲块");
-    let bin_len = u32::from_le_bytes(bytes[bin_offset..bin_offset + 4].try_into().unwrap()) as usize;
+    let bin_len =
+        u32::from_le_bytes(bytes[bin_offset..bin_offset + 4].try_into().unwrap()) as usize;
     let bin = &bytes[bin_offset + 8..(bin_offset + 8 + bin_len).min(bytes.len())];
 
     let accessors = gltf["accessors"].as_array().context("GLB 无 accessors")?;
-    let views = gltf["bufferViews"].as_array().context("GLB 无 bufferViews")?;
+    let views = gltf["bufferViews"]
+        .as_array()
+        .context("GLB 无 bufferViews")?;
     let meshes = gltf["meshes"].as_array().context("GLB 无 meshes")?;
 
     let mut out = Vec::new();
     for mesh in meshes {
-        let Some(prims) = mesh["primitives"].as_array() else { continue };
+        let Some(prims) = mesh["primitives"].as_array() else {
+            continue;
+        };
         for prim in prims {
             if prim["mode"].as_u64().unwrap_or(4) != 4 {
                 continue;
@@ -838,15 +924,24 @@ fn parse_glb(bytes: &[u8]) -> Result<Vec<MeshVertex>> {
                     let fnrm = face_normal(p0, p1, p2);
                     out.push(MeshVertex {
                         position: p0,
-                        normal: normals.as_ref().and_then(|n| n.get(i0).copied()).unwrap_or(fnrm),
+                        normal: normals
+                            .as_ref()
+                            .and_then(|n| n.get(i0).copied())
+                            .unwrap_or(fnrm),
                     });
                     out.push(MeshVertex {
                         position: p1,
-                        normal: normals.as_ref().and_then(|n| n.get(i1).copied()).unwrap_or(fnrm),
+                        normal: normals
+                            .as_ref()
+                            .and_then(|n| n.get(i1).copied())
+                            .unwrap_or(fnrm),
                     });
                     out.push(MeshVertex {
                         position: p2,
-                        normal: normals.as_ref().and_then(|n| n.get(i2).copied()).unwrap_or(fnrm),
+                        normal: normals
+                            .as_ref()
+                            .and_then(|n| n.get(i2).copied())
+                            .unwrap_or(fnrm),
                     });
                 }
             } else {
@@ -856,7 +951,10 @@ fn parse_glb(bytes: &[u8]) -> Result<Vec<MeshVertex>> {
                         let vi = t * 3 + k;
                         out.push(MeshVertex {
                             position: tri[k],
-                            normal: normals.as_ref().and_then(|n| n.get(vi).copied()).unwrap_or(fnrm),
+                            normal: normals
+                                .as_ref()
+                                .and_then(|n| n.get(vi).copied())
+                                .unwrap_or(fnrm),
                         });
                     }
                 }
@@ -873,13 +971,19 @@ fn read_glb_vec3(
     acc_idx: usize,
 ) -> Result<Vec<[f32; 3]>> {
     let acc = accessors.get(acc_idx).context("accessor 越界")?;
-    ensure!(acc["componentType"].as_u64() == Some(5126) && acc["type"].as_str() == Some("VEC3"), "仅支持 FLOAT VEC3");
+    ensure!(
+        acc["componentType"].as_u64() == Some(5126) && acc["type"].as_str() == Some("VEC3"),
+        "仅支持 FLOAT VEC3"
+    );
     let count = acc["count"].as_u64().unwrap_or(0) as usize;
     let view_idx = acc["bufferView"].as_u64().context("缺少 bufferView")? as usize;
     let view = views.get(view_idx).context("bufferView 越界")?;
     let base = view["byteOffset"].as_u64().unwrap_or(0) as usize
         + acc["byteOffset"].as_u64().unwrap_or(0) as usize;
-    let stride = view["byteStride"].as_u64().map(|s| s as usize).unwrap_or(12);
+    let stride = view["byteStride"]
+        .as_u64()
+        .map(|s| s as usize)
+        .unwrap_or(12);
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
         let off = base + i * stride;
@@ -904,7 +1008,9 @@ fn read_glb_indices(
     let acc = accessors.get(acc_idx).context("index accessor 越界")?;
     let comp = acc["componentType"].as_u64().unwrap_or(0);
     let count = acc["count"].as_u64().unwrap_or(0) as usize;
-    let view_idx = acc["bufferView"].as_u64().context("缺少 index bufferView")? as usize;
+    let view_idx = acc["bufferView"]
+        .as_u64()
+        .context("缺少 index bufferView")? as usize;
     let view = views.get(view_idx).context("index bufferView 越界")?;
     let base = view["byteOffset"].as_u64().unwrap_or(0) as usize
         + acc["byteOffset"].as_u64().unwrap_or(0) as usize;

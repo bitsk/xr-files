@@ -48,7 +48,7 @@ struct WindowRunner<'a> {
     left_down: bool,
     middle_orbit_down: bool,
     last_orbit_px: [f32; 2],
-    right_just_clicked: bool,
+    right_down: bool,
     back_just_clicked: bool,
     scroll_stick_y: f32,
     cam_yaw: f32,
@@ -67,7 +67,7 @@ impl<'a> WindowRunner<'a> {
             left_down: false,
             middle_orbit_down: false,
             last_orbit_px: [640.0, 400.0],
-            right_just_clicked: false,
+            right_down: false,
             back_just_clicked: false,
             scroll_stick_y: 0.0,
             cam_yaw: 0.0,
@@ -79,7 +79,7 @@ impl<'a> WindowRunner<'a> {
     fn initialize_gpu(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
         let attrs = WindowAttributes::default()
             .with_title("空间文件 · openKylin XR Files")
-            .with_inner_size(PhysicalSize::new(1560, 720));
+            .with_inner_size(PhysicalSize::new(1600, 900));
         let window = Arc::new(event_loop.create_window(attrs)?);
         let size = window.inner_size();
 
@@ -188,7 +188,7 @@ impl<'a> WindowRunner<'a> {
             aim_dir: ray_dir,
             trigger_pressed: self.left_down,
             squeeze_pressed: false,
-            secondary_just_pressed: std::mem::replace(&mut self.right_just_clicked, false),
+            secondary_pressed: self.right_down,
             back_just_pressed: std::mem::replace(&mut self.back_just_clicked, false),
             thumb_click_just_pressed: false,
             stick: [0.0, std::mem::replace(&mut self.scroll_stick_y, 0.0)],
@@ -210,7 +210,8 @@ impl<'a> WindowRunner<'a> {
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        gpu.renderer.render_views(&[(&view, w, h, eye)], &scene, 1.0);
+        gpu.renderer
+            .render_views(&[(&view, w, h, eye)], &scene, 1.0);
         frame.present();
         self.app.submitted_frames += 1;
         gpu.window.request_redraw();
@@ -256,15 +257,16 @@ impl ApplicationHandler for WindowRunner<'_> {
                 self.last_orbit_px = px;
                 self.cursor_px = px;
             }
+            WindowEvent::CursorLeft { .. } | WindowEvent::Focused(false) => {
+                self.left_down = false;
+                self.right_down = false;
+                self.middle_orbit_down = false;
+            }
             WindowEvent::MouseInput { state, button, .. } => {
                 let down = state == ElementState::Pressed;
                 match button {
                     MouseButton::Left => self.left_down = down,
-                    MouseButton::Right => {
-                        if down {
-                            self.right_just_clicked = true;
-                        }
-                    }
+                    MouseButton::Right => self.right_down = down,
                     MouseButton::Middle => {
                         self.middle_orbit_down = down;
                         self.last_orbit_px = self.cursor_px;
@@ -328,6 +330,9 @@ impl ApplicationHandler for WindowRunner<'_> {
                     }
                 }
                 match event.logical_key {
+                    Key::Named(NamedKey::Space) if self.app.prompt_mode.is_none() => {
+                        self.app.toggle_quick_look()
+                    }
                     Key::Named(NamedKey::Escape) => self.app.cancel_modals(),
                     Key::Named(NamedKey::Enter) => self.app.commit_prompt(),
                     Key::Named(NamedKey::Backspace) => self.app.handle_backspace(),

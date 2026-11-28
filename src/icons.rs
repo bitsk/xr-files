@@ -5,7 +5,7 @@
 use crate::{fs_ops::FileKind, preview::MipmappedRgba, simd};
 
 pub const BUILTIN_ICON_COUNT: u32 = 38;
-const ICON_EDGE: u32 = 128;
+const ICON_EDGE: u32 = 256;
 
 /// Tintable monochrome vector SDF icons (`tex_kind == 5`, rendered via linear-alpha coverage).
 #[repr(u32)]

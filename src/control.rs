@@ -237,6 +237,7 @@ fn execute_command(
                         .find(|(_, e)| e.path == p)
                     {
                         app.select_single(idx);
+                        app.quick_look_open = true;
                     }
                 } else {
                     bail!("目标路径不存在: {path}");

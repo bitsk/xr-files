@@ -4,6 +4,7 @@
 use serde_json::Value;
 use std::{
     env, fs,
+    sync::Mutex,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use xr_files::{
@@ -14,8 +15,11 @@ use xr_files::{
     text::GlyphAtlas,
 };
 
+static GPU_TEST: Mutex<()> = Mutex::new(());
+
 #[test]
 fn wgpu_stereo_workbench_and_treemap3d_render_distinct_parallax_pixels() {
+    let _gpu = GPU_TEST.lock().unwrap();
     let tmp = env::temp_dir().join(format!(
         "xr-files-gpu-test-{}-{}",
         std::process::id(),
@@ -25,7 +29,11 @@ fn wgpu_stereo_workbench_and_treemap3d_render_distinct_parallax_pixels() {
             .as_nanos()
     ));
     fs::create_dir_all(tmp.join("空间文档")).unwrap();
-    fs::write(tmp.join("readme.md"), "# openKylin XR Spatial Files\nSIMD + wgpu\n").unwrap();
+    fs::write(
+        tmp.join("readme.md"),
+        "# openKylin XR Spatial Files\nSIMD + wgpu\n",
+    )
+    .unwrap();
     fs::write(
         tmp.join("crystal.obj"),
         "v -1 0 0\nv 1 0 0\nv 0 1.5 0\nv 0 0.5 1\nf 1 2 3\nf 1 2 4\n",
@@ -77,7 +85,10 @@ fn wgpu_stereo_workbench_and_treemap3d_render_distinct_parallax_pixels() {
     for mode in [ViewMode::Workbench, ViewMode::Treemap3D] {
         app.set_view_mode(mode);
         let scene = app.step_and_build_scene(&eyes, &hands, &mut glyphs);
-        assert!(!scene.quads.is_empty(), "quads must not be empty in {mode:?}");
+        assert!(
+            !scene.quads.is_empty(),
+            "quads must not be empty in {mode:?}"
+        );
         assert!(
             !scene.solid_vertices.is_empty(),
             "3D solid vertices must not be empty in {mode:?}"
@@ -138,7 +149,8 @@ fn control_socket_executes_search_mkdir_view_and_undo() {
     let sock_client = sock.clone();
     let client = std::thread::spawn(move || {
         let r1: Value = serde_json::from_str(
-            &control::send_raw_command(&sock_client, r#"{"op":"mkdir","name":"三维资产"}"#).unwrap(),
+            &control::send_raw_command(&sock_client, r#"{"op":"mkdir","name":"三维资产"}"#)
+                .unwrap(),
         )
         .unwrap();
         assert_eq!(r1["ok"], true);
@@ -184,14 +196,18 @@ fn control_socket_executes_search_mkdir_view_and_undo() {
     }
     server.poll_and_apply(&mut app);
     client.join().unwrap();
-    assert!(!work.join("三维资产").exists(), "undo must remove created folder");
+    assert!(
+        !work.join("三维资产").exists(),
+        "undo must remove created folder"
+    );
 
     drop(server);
     let _ = fs::remove_dir_all(&tmp);
 }
 
 #[test]
-fn embedded_wayland_argb8888_preserves_transparent_sky_gap_and_premultiplied_invariants() {
+fn windowless_ornaments_leave_outer_corners_transparent_in_wayland_argb8888() {
+    let _gpu = GPU_TEST.lock().unwrap();
     let tmp = env::temp_dir().join(format!(
         "xr-files-wl-test-{}-{}",
         std::process::id(),
@@ -227,6 +243,64 @@ fn embedded_wayland_argb8888_preserves_transparent_sky_gap_and_premultiplied_inv
         .render_offscreen_wayland_argb8888(w, h, eye, &scene, &mut argb)
         .expect("render wayland argb8888");
 
+    assert!(app.quick_look_open, "file launch opens Quick Look");
+    assert!(
+        !scene.solid_vertices.is_empty(),
+        "Quick Look contains the actual OBJ mesh with no input beam"
+    );
+    for (x, y) in [(4, 4), (w - 5, 4), (4, h - 5), (w - 5, h - 5)] {
+        assert_eq!(
+            argb[((y * w + x) * 4 + 3) as usize],
+            0,
+            "outer corner {x},{y}"
+        );
+    }
+    let mut stereo_eyes = [eye, eye];
+    stereo_eyes[0].position[0] -= 0.032;
+    stereo_eyes[1].position[0] += 0.032;
+    let [left, right] = renderer
+        .render_stereo_offscreen_rgba(w, h, &stereo_eyes, &scene)
+        .unwrap();
+    let differences = left
+        .chunks_exact(4)
+        .zip(right.chunks_exact(4))
+        .filter(|(l, r)| l != r)
+        .count();
+    assert!(
+        differences > 2_000,
+        "Quick Look mesh and stage retain binocular parallax: {differences}"
+    );
+    if let Some(dir) = env::var_os("XR_FILES_TEST_CAPTURE_DIR") {
+        fs::create_dir_all(&dir).unwrap();
+        let rgba: Vec<u8> = argb
+            .chunks_exact(4)
+            .flat_map(|p| [p[2], p[1], p[0], p[3]])
+            .collect();
+        image::save_buffer(
+            std::path::Path::new(&dir).join("quick-look-argb.png"),
+            &rgba,
+            w,
+            h,
+            image::ColorType::Rgba8,
+        )
+        .unwrap();
+        image::save_buffer(
+            std::path::Path::new(&dir).join("quick-look-left.png"),
+            &left,
+            w,
+            h,
+            image::ColorType::Rgba8,
+        )
+        .unwrap();
+        image::save_buffer(
+            std::path::Path::new(&dir).join("quick-look-right.png"),
+            &right,
+            w,
+            h,
+            image::ColorType::Rgba8,
+        )
+        .unwrap();
+    }
     let mut transparent_px = 0usize;
     let mut visible_px = 0usize;
     for px in argb.chunks_exact(4) {
@@ -247,7 +321,7 @@ fn embedded_wayland_argb8888_preserves_transparent_sky_gap_and_premultiplied_inv
     );
     assert!(
         visible_px > 80_000,
-        "embedded panel must render rich two-pane spatial workbench & preview (got {visible_px})"
+        "embedded panel must render windowless shelf and central Quick Look (got {visible_px})"
     );
 
     let _ = fs::remove_dir_all(&tmp);

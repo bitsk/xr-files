@@ -1,14 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! OpenXR 6DoF Dual-Hand Controller Action Set, Schmitt Trigger Hysteresis,
-//! Quadratic Thumbstick Curve, Hold-to-Context-Menu Fallback, and Graded Haptics.
+//! Quadratic Thumbstick Curve, held secondary buttons, and Graded Haptics.
 
 use crate::{
     app::{HandControllerInput, HapticEvent},
-    spatial::{quat_forward, vec3_dot, Pose3D},
+    spatial::{quat_forward, Pose3D},
 };
 use anyhow::{Context, Result};
 use openxr as xr;
-use std::time::{Duration, Instant};
 
 const TRIGGER_PRESS_TH: f32 = 0.65;
 const TRIGGER_RELEASE_TH: f32 = 0.35;
@@ -69,13 +68,6 @@ impl EdgeButton {
     }
 }
 
-#[derive(Default, Clone, Copy)]
-struct HoldRightClickState {
-    started_at: Option<Instant>,
-    start_dir: [f32; 3],
-    fired: bool,
-}
-
 pub struct XrControllers {
     action_set: xr::ActionSet,
     subpaths: [xr::Path; 2],
@@ -95,10 +87,9 @@ pub struct XrControllers {
 
     trig_gates: [SchmittGate; 2],
     sqz_gates: [SchmittGate; 2],
-    sec_btns: [EdgeButton; 2],
+    sec_gates: [SchmittGate; 2],
     back_btns: [EdgeButton; 2],
     thumb_btns: [EdgeButton; 2],
-    hold_rc: [HoldRightClickState; 2],
 }
 
 impl XrControllers {
@@ -112,12 +103,16 @@ impl XrControllers {
         let right = instance.string_to_path("/user/hand/right")?;
         let subpaths = [left, right];
 
-        let grip_action = action_set.create_action::<xr::Posef>("grip_pose", "Grip Pose", &subpaths)?;
-        let aim_action = action_set.create_action::<xr::Posef>("aim_pose", "Aim Pose", &subpaths)?;
-        let trigger_val = action_set.create_action::<f32>("trigger_val", "Trigger Value", &subpaths)?;
+        let grip_action =
+            action_set.create_action::<xr::Posef>("grip_pose", "Grip Pose", &subpaths)?;
+        let aim_action =
+            action_set.create_action::<xr::Posef>("aim_pose", "Aim Pose", &subpaths)?;
+        let trigger_val =
+            action_set.create_action::<f32>("trigger_val", "Trigger Value", &subpaths)?;
         let trigger_click =
             action_set.create_action::<bool>("trigger_click", "Trigger Click", &subpaths)?;
-        let squeeze_val = action_set.create_action::<f32>("squeeze_val", "Squeeze Value", &subpaths)?;
+        let squeeze_val =
+            action_set.create_action::<f32>("squeeze_val", "Squeeze Value", &subpaths)?;
         let squeeze_click =
             action_set.create_action::<bool>("squeeze_click", "Squeeze Click", &subpaths)?;
         let secondary_click =
@@ -288,20 +283,18 @@ impl XrControllers {
             haptic,
             trig_gates: [SchmittGate::default(); 2],
             sqz_gates: [SchmittGate::default(); 2],
-            sec_btns: [EdgeButton::default(); 2],
+            sec_gates: [SchmittGate::default(); 2],
             back_btns: [EdgeButton::default(); 2],
             thumb_btns: [EdgeButton::default(); 2],
-            hold_rc: [HoldRightClickState::default(); 2],
         })
     }
 
     pub fn reset(&mut self) {
         self.trig_gates = [SchmittGate::default(); 2];
         self.sqz_gates = [SchmittGate::default(); 2];
-        self.sec_btns = [EdgeButton::default(); 2];
+        self.sec_gates = [SchmittGate::default(); 2];
         self.back_btns = [EdgeButton::default(); 2];
         self.thumb_btns = [EdgeButton::default(); 2];
-        self.hold_rc = [HoldRightClickState::default(); 2];
     }
 
     pub fn poll(
@@ -311,7 +304,6 @@ impl XrControllers {
         time: xr::Time,
     ) -> Result<[HandControllerInput; 2]> {
         session.sync_actions(&[xr::ActiveActionSet::new(&self.action_set)])?;
-        let now = Instant::now();
         let mut out = [HandControllerInput::default(); 2];
         let _ = (&self.grip_action, &self.aim_action);
 
@@ -324,10 +316,9 @@ impl XrControllers {
             if !aim_loc.location_flags.contains(valid_flags) {
                 self.trig_gates[h].reset();
                 self.sqz_gates[h].reset();
-                self.sec_btns[h].reset();
+                self.sec_gates[h].reset();
                 self.back_btns[h].reset();
                 self.thumb_btns[h].reset();
-                self.hold_rc[h] = HoldRightClickState::default();
                 continue;
             }
 
@@ -349,8 +340,12 @@ impl XrControllers {
                 0.0
             };
             let trig_active = tv.is_active || tc.is_active;
-            let trigger_pressed =
-                self.trig_gates[h].update(trig_active, trig_raw, TRIGGER_PRESS_TH, TRIGGER_RELEASE_TH);
+            let trigger_pressed = self.trig_gates[h].update(
+                trig_active,
+                trig_raw,
+                TRIGGER_PRESS_TH,
+                TRIGGER_RELEASE_TH,
+            );
 
             let sv = self.squeeze_val.state(session, sp)?;
             let sc = self.squeeze_click.state(session, sp)?;
@@ -366,32 +361,12 @@ impl XrControllers {
                 self.sqz_gates[h].update(sqz_active, sqz_raw, SQUEEZE_PRESS_TH, SQUEEZE_RELEASE_TH);
 
             let sec = self.secondary_click.state(session, sp)?;
-            let mut secondary_just_pressed =
-                self.sec_btns[h].just_pressed(sec.is_active, sec.current_state);
-
-            // Stationary 650ms trigger hold fallback for controllers lacking dedicated A/X buttons
-            if trigger_pressed && !sec.is_active {
-                let st = &mut self.hold_rc[h];
-                match st.started_at {
-                    None => {
-                        st.started_at = Some(now);
-                        st.start_dir = aim_dir;
-                        st.fired = false;
-                    }
-                    Some(t0) if !st.fired => {
-                        let cos_a = vec3_dot(st.start_dir, aim_dir).clamp(-1.0, 1.0);
-                        if cos_a.acos() > 0.9f32.to_radians() {
-                            st.fired = true; // Moved -> regular drag, cancel hold-right-click
-                        } else if now.duration_since(t0) >= Duration::from_millis(650) {
-                            st.fired = true;
-                            secondary_just_pressed = true;
-                        }
-                    }
-                    _ => {}
-                }
-            } else {
-                self.hold_rc[h] = HoldRightClickState::default();
-            }
+            let secondary_pressed = self.sec_gates[h].update(
+                sec.is_active,
+                if sec.current_state { 1.0 } else { 0.0 },
+                0.5,
+                0.5,
+            );
 
             let bk = self.back_click.state(session, sp)?;
             let back_just_pressed = self.back_btns[h].just_pressed(bk.is_active, bk.current_state);
@@ -417,7 +392,7 @@ impl XrControllers {
                 aim_dir,
                 trigger_pressed,
                 squeeze_pressed,
-                secondary_just_pressed,
+                secondary_pressed,
                 back_just_pressed,
                 thumb_click_just_pressed,
                 stick,

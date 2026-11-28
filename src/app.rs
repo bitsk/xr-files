@@ -1,11 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Spatial File Manager Application State Machine & Icon-First UKUI XR "Qingkong" Scene Builder.
-//! Design Philosophy:
-//! - Icon-First Zero-Clutter Chrome: Spatial Icon Rail on left, pure SDF vector icon toolbar in header,
-//!   4-orb circular spatial action dock on the right preview stage, and 4×2 icon context palette.
-//!   Text labels appear only as contextual hover tooltips or concise single-word stems!
-//! - Visual Imagery First: Unobstructed 16:9 Panoramic Hero Media Showcase Strip + deduplicated
-//!   full-bleed visual cards & golden folders + massive full-bleed Right Visual Preview Stage.
+//! Windowless spatial shelf, magnetic input, marking menu, pocket and Quick Look.
 
 use crate::{
     fs_ops::{
@@ -33,9 +27,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub const CARDS_PER_PAGE: usize = 8; // 3 Hero Media Cards on top + 8 unique Grid Cards (4×2)
-const GRID_COLS: usize = 4;
-const HIT_SLOP_RAD: f32 = 0.0384; // 2.2° minimum angular target rule
+pub const CARDS_PER_PAGE: usize = 6;
+const GRID_COLS: usize = 3;
+pub const CARD_TITLE_M: f32 = 0.033;
+pub const HIT_SLOP_RAD: f32 = 0.056; // 3.2 degree magnetic capture cone
 
 #[inline]
 fn srgb_chan_to_linear(u: u8) -> f32 {
@@ -57,12 +52,6 @@ fn qk_rgba(r: u8, g: u8, b: u8, a: f32) -> [f32; 4] {
     ]
 }
 
-fn col_glass_window() -> [f32; 4] {
-    qk_rgba(235, 243, 252, 0.58)
-}
-fn col_content_canvas() -> [f32; 4] {
-    qk_rgba(248, 251, 255, 0.62)
-}
 fn col_card_surface() -> [f32; 4] {
     qk_rgba(255, 255, 255, 0.80)
 }
@@ -71,9 +60,6 @@ fn col_card_hover() -> [f32; 4] {
 }
 fn col_card_selected() -> [f32; 4] {
     qk_rgba(232, 243, 255, 0.94)
-}
-fn col_ghost_hover() -> [f32; 4] {
-    qk_rgba(255, 255, 255, 0.62)
 }
 fn col_orb_idle() -> [f32; 4] {
     qk_rgba(255, 255, 255, 0.56)
@@ -117,7 +103,7 @@ pub struct HandControllerInput {
     pub aim_dir: [f32; 3],
     pub trigger_pressed: bool,
     pub squeeze_pressed: bool,
-    pub secondary_just_pressed: bool,
+    pub secondary_pressed: bool,
     pub back_just_pressed: bool,
     pub thumb_click_just_pressed: bool,
     pub stick: [f32; 2],
@@ -158,41 +144,69 @@ pub struct FrameScene {
     pub quads: Vec<QuadInstance>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 enum HitAction {
     NavigateLocation(String),
     ToggleView(ViewMode),
-    CycleSort,
-    ToggleHidden,
     PageDelta(isize),
     SelectEntry(usize),
-    NavigateUp,
+    QuickLookEntry(usize),
     NavigateBack,
     StartPrompt(PromptMode),
-    ClearSearch,
     PromptBackspace,
     PromptCommit,
     PromptCancel,
-    InspectorOpen { cinema: bool },
+    InspectorOpen,
     InspectorTrashOrRestore,
-    OpenContextMenuHere,
     UndoLast,
-    RecenterWorkspace,
-    GrabWorkspaceBar,
-    ContextAction(ContextMenuOp),
+    StashSelected,
+    GrabPocket,
+    DeployPocket,
+    ClearPocket,
+    QuickLookClose,
+    OrbitModel,
+    RadialSector(usize),
+    DismissRadial,
 }
 
+#[derive(Debug, Clone)]
+struct StableHover {
+    index: usize,
+    action: HitAction,
+    point: [f32; 3],
+    ray_dir: [f32; 3],
+    at: Instant,
+}
+#[derive(Debug, Clone)]
+struct PressHold {
+    at: Instant,
+    point: [f32; 3],
+    action: Option<HitAction>,
+    fired: bool,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ContextMenuOp {
-    Open,
-    OpenCinema,
-    Copy,
-    Cut,
-    Paste,
-    NewFolder,
-    Rename,
-    TrashOrRestore,
-    Close,
+enum InputLayer {
+    Shelf,
+    QuickLook,
+    Radial,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RadialSource {
+    Secondary,
+    LongPress,
+}
+#[derive(Debug, Clone)]
+struct RadialMenuState {
+    hand: usize,
+    anchor_world: [f32; 3],
+    center_ray_dir: [f32; 3],
+    opened_at: Instant,
+    latched_open: bool,
+    active_sector: Option<usize>,
+    orientation: [f32; 4],
+    source: RadialSource,
+    on_entry: bool,
+    sort_hidden: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -209,11 +223,8 @@ struct DragSession {
     primary_label: String,
     start_point: [f32; 3],
     active_drag: bool,
-}
-
-#[derive(Debug, Clone)]
-struct ContextMenuState {
-    anchor_world: [f32; 3],
+    via_squeeze: bool,
+    from_pocket: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -221,7 +232,6 @@ struct WorkspaceGrab {
     hand: usize,
     start_ray_dir: [f32; 3],
     base_yaw: f32,
-    via_trigger: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -240,6 +250,13 @@ pub struct StatusSnapshot {
     pub undo_depth: usize,
     pub status_message: String,
     pub submitted_frames: u64,
+    pub quick_look_open: bool,
+    pub radial_menu_open: bool,
+    pub radial_active_sector: Option<usize>,
+    pub drop_pocket: Vec<String>,
+    pub holo_yaw_pitch: [f32; 2],
+    pub cards_per_page: usize,
+    pub press_lock_recoveries: u64,
 }
 
 pub struct SpatialFilesApp {
@@ -299,7 +316,20 @@ pub struct SpatialFilesApp {
     stick_cooldown_until: [Instant; 2],
     drag_session: Option<DragSession>,
     workspace_grab: Option<WorkspaceGrab>,
-    context_menu: Option<ContextMenuState>,
+    radial_menu: Option<RadialMenuState>,
+    pub drop_pocket: Vec<PathBuf>,
+    pub quick_look_open: bool,
+    pub holo_yaw_pitch: [f32; 2],
+    pub holo_orbit_drag: Option<(usize, [f32; 3], [f32; 2])>,
+    pub page_scroll_offset: f32,
+    pub press_lock_recoveries: u64,
+    holo_user_rotated: bool,
+    prev_secondary: [bool; 2],
+    recent_stable_hover: [Option<StableHover>; 2],
+    press_hold: [Option<PressHold>; 2],
+    hit_layer: InputLayer,
+    control_lifts: Vec<f32>,
+    path_pill_width: f32,
     pending_haptics: [Option<HapticEvent>; 2],
 
     start_instant: Instant,
@@ -308,17 +338,16 @@ pub struct SpatialFilesApp {
 
 impl SpatialFilesApp {
     pub fn new(initial_path: Option<PathBuf>) -> Self {
-        let initial_file = initial_path
-            .as_ref()
-            .filter(|p| p.is_file())
-            .cloned();
+        let initial_file = initial_path.as_ref().filter(|p| p.is_file()).cloned();
         let start_loc = initial_path
             .filter(|p| p.exists())
             .map(|p| {
                 if p.is_dir() {
                     p
                 } else {
-                    p.parent().map(Path::to_path_buf).unwrap_or_else(fs_ops::home_dir)
+                    p.parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(fs_ops::home_dir)
                 }
             })
             .unwrap_or_else(fs_ops::home_dir)
@@ -377,7 +406,20 @@ impl SpatialFilesApp {
             stick_cooldown_until: [now, now],
             drag_session: None,
             workspace_grab: None,
-            context_menu: None,
+            radial_menu: None,
+            drop_pocket: Vec::new(),
+            quick_look_open: false,
+            holo_yaw_pitch: [0.0; 2],
+            holo_orbit_drag: None,
+            page_scroll_offset: 0.0,
+            holo_user_rotated: false,
+            prev_secondary: [false; 2],
+            recent_stable_hover: [None, None],
+            press_hold: [None, None],
+            hit_layer: InputLayer::Shelf,
+            control_lifts: Vec::new(),
+            path_pill_width: 0.60,
+            press_lock_recoveries: 0,
             pending_haptics: [None, None],
             start_instant: now,
             last_step_instant: now,
@@ -385,6 +427,7 @@ impl SpatialFilesApp {
         app.reload_directory();
         if let Some(target_file) = initial_file {
             app.select_by_path(&target_file);
+            app.quick_look_open = true;
         }
         app
     }
@@ -419,12 +462,11 @@ impl SpatialFilesApp {
         }
     }
 
-    /// Computes an aspect-preserving camera frustum that frames the coplanar two-pane
-    /// Spatial Workbench + Right Preview Stage inside a HyperSpace Wayland surface.
+    /// Aspect-preserving virtual view of the shelf and its independent ornaments.
     pub fn embedded_eye(width: u32, height: u32) -> EyeView {
         let aspect = (width.max(1) as f32 / height.max(1) as f32).clamp(0.6, 4.0);
-        let tan_x0 = 0.905f32 / 1.24f32;
-        let tan_y0 = 0.402f32 / 1.24f32;
+        let tan_x0 = 0.84f32 / 1.24f32;
+        let tan_y0 = 0.49f32 / 1.24f32;
         let design_aspect = tan_x0 / tan_y0;
         let (tan_x, tan_y) = if aspect >= design_aspect {
             (tan_y0 * aspect, tan_y0)
@@ -445,11 +487,12 @@ impl SpatialFilesApp {
         if !self.pending_gpu_thumbs.is_empty() || self.pending_gpu_inspect_image.is_some() {
             return true;
         }
-        if self
-            .previewer
-            .active_inspect
-            .as_ref()
-            .is_some_and(|p| p.mesh.is_some())
+        if self.quick_look_open
+            && self
+                .previewer
+                .active_inspect
+                .as_ref()
+                .is_some_and(|p| p.mesh.is_some())
         {
             return true;
         }
@@ -464,6 +507,20 @@ impl SpatialFilesApp {
                 .zip(self.treemap_lift_tgt.iter())
                 .any(|(a, b)| (a - b).abs() > 0.0005);
         spring_moving
+            || self.page_scroll_offset.abs() > 0.0002
+            || self.prev_trigger.iter().any(|p| *p)
+            || self.prev_secondary.iter().any(|p| *p)
+            || self.radial_menu.is_some()
+            || self.hovered_hit.iter().any(Option::is_some)
+            || self.control_lifts.iter().any(|lift| *lift > 0.0002)
+            || (self.path_pill_width
+                - if self.prompt_mode.is_some() {
+                    0.68
+                } else {
+                    0.60
+                })
+            .abs()
+                > 0.0002
     }
 
     pub fn status_snapshot(&self) -> StatusSnapshot {
@@ -489,6 +546,17 @@ impl SpatialFilesApp {
             undo_depth: self.undo_stack.len(),
             status_message: self.status_message.clone(),
             submitted_frames: self.submitted_frames,
+            quick_look_open: self.quick_look_open,
+            radial_menu_open: self.radial_menu.is_some(),
+            radial_active_sector: self.radial_menu.as_ref().and_then(|m| m.active_sector),
+            drop_pocket: self
+                .drop_pocket
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect(),
+            holo_yaw_pitch: self.holo_yaw_pitch,
+            cards_per_page: CARDS_PER_PAGE,
+            press_lock_recoveries: self.press_lock_recoveries,
         }
     }
 
@@ -503,7 +571,8 @@ impl SpatialFilesApp {
         self.current_location = loc;
         self.search_query.clear();
         self.page = 0;
-        self.context_menu = None;
+        self.radial_menu = None;
+        self.quick_look_open = false;
         self.reload_directory();
     }
 
@@ -521,6 +590,11 @@ impl SpatialFilesApp {
     }
 
     pub fn reload_directory(&mut self) {
+        self.radial_menu = None;
+        self.quick_look_open = false;
+        self.holo_orbit_drag = None;
+        self.recent_stable_hover = [None, None];
+        self.last_click = [None, None];
         match fs_ops::read_location_entries(&self.current_location, self.show_hidden) {
             Ok(mut entries) => {
                 fs_ops::sort_entries(&mut entries, self.sort_by, self.ascending);
@@ -567,48 +641,8 @@ impl SpatialFilesApp {
         self.treemap_dirty = true;
     }
 
-    fn hero_entry_indices(&self) -> Vec<usize> {
-        if !self.search_query.is_empty() {
-            return Vec::new();
-        }
-        self.filtered_indices
-            .iter()
-            .copied()
-            .filter(|&idx| self.all_entries[idx].kind != FileKind::Directory)
-            .take(3)
-            .collect()
-    }
-
-    fn grid_entry_indices(&self, hero: &[usize]) -> Vec<usize> {
-        if hero.is_empty() {
-            return self.filtered_indices.clone();
-        }
-        let rest: Vec<usize> = self
-            .filtered_indices
-            .iter()
-            .copied()
-            .filter(|idx| !hero.contains(idx))
-            .collect();
-        if rest.is_empty() {
-            Vec::new()
-        } else {
-            rest
-        }
-    }
-
     pub fn page_count(&self) -> usize {
-        let hero = self.hero_entry_indices();
-        let grid_len = self.grid_entry_indices(&hero).len();
-        let per_page = if hero.is_empty() {
-            GRID_COLS * 3
-        } else {
-            CARDS_PER_PAGE
-        };
-        if grid_len == 0 {
-            1
-        } else {
-            (grid_len + per_page - 1) / per_page
-        }
+        self.filtered_indices.len().div_ceil(CARDS_PER_PAGE).max(1)
     }
 
     pub fn select_single(&mut self, entry_idx: usize) {
@@ -641,7 +675,10 @@ impl SpatialFilesApp {
     }
 
     pub fn create_folder_named(&mut self, name: &str) -> Result<PathBuf> {
-        anyhow::ensure!(self.current_location != TRASH_URI, "不能在回收站内新建文件夹");
+        anyhow::ensure!(
+            self.current_location != TRASH_URI,
+            "不能在回收站内新建文件夹"
+        );
         let (created, undo) = fs_ops::create_directory(Path::new(&self.current_location), name)?;
         self.undo_stack.push(undo);
         self.reload_directory();
@@ -651,6 +688,7 @@ impl SpatialFilesApp {
     }
 
     pub fn rename_selected(&mut self, new_name: &str) -> Result<PathBuf> {
+        anyhow::ensure!(self.current_location != TRASH_URI, "请先还原再重命名");
         let idx = self
             .primary_selected
             .ok_or_else(|| anyhow::anyhow!("请先选择要重命名的项目"))?;
@@ -792,7 +830,11 @@ impl SpatialFilesApp {
         match mode {
             PromptMode::Search => self.set_search_query(text),
             PromptMode::NewFolder => {
-                let name = if text.is_empty() { "新建文件夹" } else { &text };
+                let name = if text.is_empty() {
+                    "新建文件夹"
+                } else {
+                    &text
+                };
                 if let Err(e) = self.create_folder_named(name) {
                     self.status_message = format!("新建失败: {e}");
                 }
@@ -808,7 +850,12 @@ impl SpatialFilesApp {
     }
 
     pub fn cancel_modals(&mut self) {
-        if self.context_menu.take().is_some() {
+        if self.radial_menu.take().is_some() {
+            return;
+        }
+        if self.quick_look_open {
+            self.quick_look_open = false;
+            self.holo_orbit_drag = None;
             return;
         }
         if self.prompt_mode.take().is_some() {
@@ -839,9 +886,7 @@ impl SpatialFilesApp {
             .find(|(_, e)| e.path == target)
         {
             self.select_single(idx);
-            let hero = self.hero_entry_indices();
-            let grid = self.grid_entry_indices(&hero);
-            if let Some(pos) = grid.iter().position(|&i| i == idx) {
+            if let Some(pos) = self.filtered_indices.iter().position(|&i| i == idx) {
                 self.page = pos / CARDS_PER_PAGE;
             }
         }
@@ -849,12 +894,72 @@ impl SpatialFilesApp {
 
     pub fn step_page(&mut self, delta: isize) {
         let total = self.page_count() as isize;
-        self.page = (self.page as isize + delta).clamp(0, (total - 1).max(0)) as usize;
+        let page = (self.page as isize + delta).clamp(0, (total - 1).max(0)) as usize;
+        if page != self.page {
+            self.page_scroll_offset = if page > self.page { 0.28 } else { -0.28 };
+            self.page = page;
+            self.treemap_dirty = true;
+            self.last_click = [None, None];
+        }
     }
 
     // ========================================================================
     // Per-Frame Simulation & Icon-First Qingkong Scene Builder
     // ========================================================================
+
+    pub fn toggle_quick_look(&mut self) {
+        if self.primary_selected.is_some() {
+            self.quick_look_open = !self.quick_look_open;
+            self.radial_menu = None;
+            self.holo_orbit_drag = None;
+        }
+    }
+
+    pub fn stash_selected(&mut self) {
+        if self.current_location == TRASH_URI {
+            self.status_message = "请先还原回收站中的项目".into();
+            return;
+        }
+        self.stash_paths(self.selected_paths());
+    }
+
+    fn stash_paths(&mut self, paths: Vec<PathBuf>) {
+        for path in paths {
+            if path.exists() && !self.drop_pocket.contains(&path) {
+                self.drop_pocket.push(path);
+            }
+        }
+        self.status_message = format!("暂存 {} 项", self.drop_pocket.len());
+    }
+
+    pub fn deploy_pocket(&mut self) -> Result<()> {
+        anyhow::ensure!(self.current_location != TRASH_URI, "不能投放到回收站");
+        anyhow::ensure!(!self.drop_pocket.is_empty(), "暂存囊为空");
+        let undo = fs_ops::move_paths_to_dir(&self.drop_pocket, Path::new(&self.current_location))?;
+        self.undo_stack.push(undo);
+        self.drop_pocket.clear();
+        self.reload_directory();
+        self.status_message = "已投放，可撤销".into();
+        Ok(())
+    }
+
+    fn main_pose(&self, eyes: &[EyeView; 2]) -> Pose3D {
+        if self.embedded_panel {
+            Pose3D {
+                position: [0.0, 1.60, -1.24],
+                orientation: [0.0, 0.0, 0.0, 1.0],
+            }
+        } else {
+            arc_panel_pose(
+                self.anchor_pos,
+                self.anchor_yaw,
+                0.0,
+                0.0,
+                self.workspace_radius,
+                center_eye_position(eyes),
+            )
+        }
+    }
 
     pub fn step_and_build_scene(
         &mut self,
@@ -862,13 +967,21 @@ impl SpatialFilesApp {
         hands: &[HandControllerInput; 2],
         glyphs: &mut GlyphAtlas,
     ) -> FrameScene {
-        let now = Instant::now();
+        self.step_at(eyes, hands, glyphs, Instant::now())
+    }
+
+    fn step_at(
+        &mut self,
+        eyes: &[EyeView; 2],
+        hands: &[HandControllerInput; 2],
+        glyphs: &mut GlyphAtlas,
+        now: Instant,
+    ) -> FrameScene {
         let dt = now
-            .duration_since(self.last_step_instant)
+            .saturating_duration_since(self.last_step_instant)
             .as_secs_f32()
             .clamp(0.001, 0.1);
         self.last_step_instant = now;
-
         let eye_center = center_eye_position(eyes);
         if !self.anchor_initialized || self.recenter_requested {
             self.anchor_pos = eye_center;
@@ -877,21 +990,28 @@ impl SpatialFilesApp {
             self.anchor_initialized = true;
             self.recenter_requested = false;
         }
-
-        for &idx in self.filtered_indices.iter().take(28) {
+        for &idx in self
+            .filtered_indices
+            .iter()
+            .skip(self.page * CARDS_PER_PAGE)
+            .take(CARDS_PER_PAGE)
+        {
             self.previewer.request_thumbnail(&self.all_entries[idx]);
         }
-
-        let photo_cap = (THUMB_LAYERS - BUILTIN_ICON_COUNT).max(1);
         for (path, mips) in self.previewer.poll() {
-            let slot = *self.thumb_slot_by_path.entry(path).or_insert_with(|| {
-                let s = BUILTIN_ICON_COUNT + (self.next_photo_slot % photo_cap);
+            let slot = if let Some(&slot) = self.thumb_slot_by_path.get(&path) {
+                slot
+            } else {
+                let cap = (THUMB_LAYERS - BUILTIN_ICON_COUNT).max(1);
+                let slot = BUILTIN_ICON_COUNT + self.next_photo_slot % cap;
                 self.next_photo_slot = self.next_photo_slot.wrapping_add(1);
-                s
-            });
+                self.thumb_slot_by_path.retain(|_, value| *value != slot);
+                self.thumb_slot_by_path.insert(path, slot);
+                slot
+            };
             self.pending_gpu_thumbs.push((slot, mips));
         }
-        if let Some(ref inspect) = self.previewer.active_inspect {
+        if let Some(inspect) = &self.previewer.active_inspect {
             if inspect.image.is_some()
                 && self.last_uploaded_inspect_path.as_ref() != Some(&inspect.path)
             {
@@ -899,1828 +1019,698 @@ impl SpatialFilesApp {
                 self.pending_gpu_inspect_image = inspect.image.clone();
             }
         }
-
-        self.process_controller_inputs(hands, now, dt);
-
-        let spring_alpha = (1.0 - (-18.0 * dt).exp()).clamp(0.05, 1.0);
-        simd::lerp_f32_slice_in_place(&mut self.slot_z_cur, &self.slot_z_tgt, spring_alpha);
-        simd::lerp_f32_slice_in_place(
-            &mut self.treemap_lift_cur,
-            &self.treemap_lift_tgt,
-            spring_alpha,
-        );
-
-        let mut scene = FrameScene::default();
+        let pose = self.main_pose(eyes);
+        self.process_controller_inputs(hands, &pose, eye_center, now, dt);
+        self.page_scroll_offset *= (-16.0 * dt).exp();
+        if self.page_scroll_offset.abs() < 0.0002 {
+            self.page_scroll_offset = 0.0;
+        }
+        let spring = (1.0 - (-18.0 * dt).exp()).clamp(0.01, 1.0);
+        simd::lerp_f32_slice_in_place(&mut self.slot_z_cur, &self.slot_z_tgt, spring);
+        simd::lerp_f32_slice_in_place(&mut self.treemap_lift_cur, &self.treemap_lift_tgt, spring);
+        for (i, lift) in self.control_lifts.iter_mut().enumerate() {
+            let target = if self.hovered_hit.contains(&Some(i)) {
+                0.028
+            } else {
+                0.0
+            };
+            *lift += (target - *lift) * spring;
+            if (*lift - target).abs() < 0.0002 {
+                *lift = target;
+            }
+        }
+        let path_width = if self.prompt_mode.is_some() {
+            0.68
+        } else {
+            0.60
+        };
+        self.path_pill_width += (path_width - self.path_pill_width) * spring;
         self.hit_batch.clear();
         self.hit_actions.clear();
-
-        if self.embedded_panel {
-            self.anchor_pos = [0.0, 1.60, 0.0];
-            self.anchor_yaw = 0.0;
-            self.workspace_radius = 1.24;
-            self.emit_main_qingkong_window(&mut scene, 0.0, eye_center, hands, glyphs);
-            self.emit_right_gallery_stage(&mut scene, 0.0, eye_center, glyphs);
-        } else {
-            let main_yaw_deg = 9.5;
-            let insp_yaw_deg = -30.5;
-            self.emit_depth_breadcrumbs(&mut scene, main_yaw_deg, eye_center, glyphs);
-            self.emit_main_qingkong_window(&mut scene, main_yaw_deg, eye_center, hands, glyphs);
-            self.emit_minimal_companion_bar(&mut scene, main_yaw_deg, eye_center, glyphs);
-            self.emit_right_gallery_stage(&mut scene, insp_yaw_deg, eye_center, glyphs);
+        self.hit_layer = InputLayer::Shelf;
+        let mut scene = FrameScene::default();
+        self.emit_ornaments(&mut scene, &pose, glyphs);
+        let mut shelf = pose;
+        shelf.position = local_world(
+            &pose,
+            [
+                self.page_scroll_offset,
+                0.0,
+                if self.quick_look_open { -0.045 } else { 0.0 },
+            ],
+        );
+        match self.view_mode {
+            ViewMode::Workbench => self.emit_spatial_shelf(&mut scene, &shelf, glyphs),
+            ViewMode::Treemap3D => {
+                self.emit_spatial_treemap(&mut scene, &shelf, eye_center, glyphs)
+            }
         }
-        if self.context_menu.is_some() {
-            self.emit_context_menu(&mut scene, eye_center, glyphs);
+        self.emit_pocket(&mut scene, &pose, glyphs);
+        if self.quick_look_open {
+            self.hit_layer = InputLayer::QuickLook;
+            self.emit_quick_look(&mut scene, &pose, glyphs);
+        }
+        if self.radial_menu.is_some() {
+            self.hit_layer = InputLayer::Radial;
+            self.emit_radial_menu(&mut scene, glyphs);
         }
         self.hit_batch.finalize_padding();
-
         self.update_hover_and_emit_hands(&mut scene, eye_center, hands, glyphs);
-
         scene
     }
 
     fn process_controller_inputs(
         &mut self,
         hands: &[HandControllerInput; 2],
+        pose: &Pose3D,
+        eye: [f32; 3],
         now: Instant,
         dt: f32,
     ) {
-        if self.hit_batch.is_empty() {
-            return;
-        }
-        for h in 0..2 {
-            let ctrl = hands[h];
+        for (h, ctrl) in hands.iter().copied().enumerate() {
+            let down = ctrl.trigger_pressed && !self.prev_trigger[h];
+            let up = !ctrl.trigger_pressed && self.prev_trigger[h];
+            let secondary_down = ctrl.secondary_pressed && !self.prev_secondary[h];
+            let secondary_up = !ctrl.secondary_pressed && self.prev_secondary[h];
+            let grip_down = ctrl.squeeze_pressed && !self.prev_squeeze[h];
+            let grip_up = !ctrl.squeeze_pressed && self.prev_squeeze[h];
+            self.prev_trigger[h] = ctrl.active && ctrl.trigger_pressed;
+            self.prev_secondary[h] = ctrl.active && ctrl.secondary_pressed;
+            self.prev_squeeze[h] = ctrl.active && ctrl.squeeze_pressed;
             if !ctrl.active {
-                self.prev_trigger[h] = false;
-                self.prev_squeeze[h] = false;
+                self.recent_stable_hover[h] = None;
+                self.press_hold[h] = None;
                 if self.drag_session.as_ref().is_some_and(|d| d.hand == h) {
                     self.drag_session = None;
                 }
-                if self.workspace_grab.as_ref().is_some_and(|g| g.hand == h) {
-                    self.workspace_grab = None;
+                if self.radial_menu.as_ref().is_some_and(|m| m.hand == h) {
+                    self.radial_menu = None;
+                }
+                if self.holo_orbit_drag.as_ref().is_some_and(|d| d.0 == h) {
+                    self.holo_orbit_drag = None;
                 }
                 continue;
             }
-
-            let pick = self.hit_batch.pick_ray(ctrl.aim_origin, ctrl.aim_dir, 0.06, 8.0);
-            let trig_just_down = ctrl.trigger_pressed && !self.prev_trigger[h];
-            let trig_just_up = !ctrl.trigger_pressed && self.prev_trigger[h];
-            let sqz_just_down = ctrl.squeeze_pressed && !self.prev_squeeze[h];
-            let sqz_just_up = !ctrl.squeeze_pressed && self.prev_squeeze[h];
-            self.prev_trigger[h] = ctrl.trigger_pressed;
-            self.prev_squeeze[h] = ctrl.squeeze_pressed;
-
             if ctrl.back_just_pressed {
                 self.cancel_modals();
+                continue;
             }
             if ctrl.thumb_click_just_pressed {
-                self.workspace_radius = 1.24;
-                self.card_scale = 1.0;
                 self.request_recenter();
             }
-
-            if ctrl.secondary_just_pressed {
-                if let Some(p) = pick {
-                    if let Some(&HitAction::SelectEntry(idx)) = self.hit_actions.get(p.index) {
-                        self.select_single(idx);
+            let mut pick = self
+                .hit_batch
+                .pick_ray(ctrl.aim_origin, ctrl.aim_dir, 0.06, 8.0);
+            if down && pick.is_none_or(|p| !p.direct) {
+                if let Some(stable) = &self.recent_stable_hover[h] {
+                    if now.saturating_duration_since(stable.at) <= Duration::from_millis(120)
+                        && angle_between(stable.ray_dir, ctrl.aim_dir) <= 2.4f32.to_radians()
+                        && self.hit_actions.get(stable.index) == Some(&stable.action)
+                    {
+                        self.press_lock_recoveries += 1;
+                        pick = Some(simd::RayPickHit {
+                            index: stable.index,
+                            distance: vec3_len(vec3_sub(stable.point, ctrl.aim_origin)),
+                            hit_point: stable.point,
+                            direct: false,
+                            border_distance: 0.0,
+                        });
                     }
                 }
-                let anchor_world = pick.map(|p| p.hit_point).unwrap_or_else(|| {
-                    vec3_add(ctrl.aim_origin, vec3_scale(ctrl.aim_dir, 1.18))
-                });
-                self.context_menu = Some(ContextMenuState { anchor_world });
-                self.pending_haptics[h] = Some(HapticEvent::ContextMenu);
             }
-
-            if sqz_just_down {
+            let action = pick.and_then(|p| self.hit_actions.get(p.index).cloned());
+            if !ctrl.trigger_pressed && !ctrl.secondary_pressed && self.radial_menu.is_none() {
                 if let Some(p) = pick {
-                    if let Some(&HitAction::SelectEntry(idx)) = self.hit_actions.get(p.index) {
+                    if let Some(action) = self.hit_actions.get(p.index).cloned() {
+                        self.recent_stable_hover[h] = Some(StableHover {
+                            index: p.index,
+                            action,
+                            point: p.hit_point,
+                            ray_dir: ctrl.aim_dir,
+                            at: now,
+                        });
+                    }
+                }
+            }
+            if self.radial_menu.is_some() {
+                let (owner, latched, source) = {
+                    let menu = self.radial_menu.as_ref().unwrap();
+                    (menu.hand, menu.latched_open, menu.source)
+                };
+                if latched && down {
+                    if let Some(HitAction::RadialSector(sector)) = action {
+                        let menu = self.radial_menu.take().unwrap();
+                        self.execute_radial_sector(sector, menu.on_entry, false);
+                    } else {
+                        self.radial_menu = None;
+                    }
+                    self.press_hold[h] = None;
+                    continue;
+                }
+                if owner == h && !latched {
+                    let menu = self.radial_menu.as_mut().unwrap();
+                    let rot = menu.orientation;
+                    let right = quat_rotate_vec3(rot, [1.0, 0.0, 0.0]);
+                    let up_axis = quat_rotate_vec3(rot, [0.0, 1.0, 0.0]);
+                    let normal = quat_rotate_vec3(rot, [0.0, 0.0, 1.0]);
+                    let center = ray_plane_point(
+                        ctrl.aim_origin,
+                        menu.center_ray_dir,
+                        menu.anchor_world,
+                        normal,
+                    )
+                    .unwrap_or(menu.anchor_world);
+                    let offset =
+                        ray_plane_point(ctrl.aim_origin, ctrl.aim_dir, menu.anchor_world, normal)
+                            .map(|p| vec3_sub(p, center))
+                            .unwrap_or([0.0; 3]);
+                    let xy = if ctrl.stick[0].hypot(ctrl.stick[1]) > 0.24 {
+                        [ctrl.stick[0] * 0.115, ctrl.stick[1] * 0.115]
+                    } else {
+                        [vec3_dot(offset, right), vec3_dot(offset, up_axis)]
+                    };
+                    let sector = radial_sector(xy);
+                    if sector != menu.active_sector {
+                        self.pending_haptics[h] = Some(HapticEvent::HoverTick);
+                        menu.active_sector = sector;
+                    }
+                    menu.sort_hidden = menu.active_sector == Some(4)
+                        && now.saturating_duration_since(menu.opened_at)
+                            >= Duration::from_millis(700);
+                    let released = match source {
+                        RadialSource::Secondary => secondary_up,
+                        RadialSource::LongPress => up,
+                    };
+                    if released {
+                        let mut menu = self.radial_menu.take().unwrap();
+                        if menu.active_sector.is_none()
+                            && source == RadialSource::Secondary
+                            && now.saturating_duration_since(menu.opened_at)
+                                < Duration::from_millis(240)
+                        {
+                            menu.latched_open = true;
+                            self.radial_menu = Some(menu);
+                        } else if let Some(sector) = menu.active_sector {
+                            self.execute_radial_sector(sector, menu.on_entry, menu.sort_hidden);
+                        }
+                        self.press_hold[h] = None;
+                    }
+                }
+                continue;
+            }
+            if let Some((owner, start_dir, base)) = self.holo_orbit_drag {
+                if owner == h {
+                    if ctrl.trigger_pressed {
+                        self.holo_yaw_pitch = [
+                            base[0] + ray_yaw_delta(start_dir, ctrl.aim_dir) * 4.0,
+                            base[1]
+                                + (ctrl.aim_dir[1].clamp(-1.0, 1.0).asin()
+                                    - start_dir[1].clamp(-1.0, 1.0).asin())
+                                    * 4.0,
+                        ];
+                        self.holo_user_rotated = true;
+                    } else {
+                        self.holo_orbit_drag = None;
+                    }
+                    continue;
+                }
+            }
+            if secondary_down {
+                self.open_radial(
+                    h,
+                    ctrl,
+                    pick.map(|p| p.hit_point),
+                    action.as_ref(),
+                    eye,
+                    now,
+                    RadialSource::Secondary,
+                );
+                continue;
+            }
+            let point = ray_plane_point(
+                ctrl.aim_origin,
+                ctrl.aim_dir,
+                pose.position,
+                quat_rotate_vec3(pose.orientation, [0.0, 0.0, 1.0]),
+            );
+            if down {
+                let eligible = !self.quick_look_open
+                    && (action.is_none() || matches!(action, Some(HitAction::SelectEntry(_))));
+                self.press_hold[h] = if eligible {
+                    point.map(|point| PressHold {
+                        at: now,
+                        point,
+                        action: action.clone(),
+                        fired: false,
+                    })
+                } else {
+                    None
+                };
+                if let Some(action) = action.clone() {
+                    self.execute_hit_press(h, action, pick.unwrap().hit_point, ctrl.aim_dir, now);
+                }
+            }
+            if ctrl.trigger_pressed {
+                if let (Some(hold), Some(point)) = (&mut self.press_hold[h], point) {
+                    let displacement = vec3_sub(point, hold.point);
+                    if !hold.fired
+                        && vec3_len(displacement) < 0.018
+                        && now.saturating_duration_since(hold.at) >= Duration::from_millis(340)
+                    {
+                        let action = hold.action.clone();
+                        hold.fired = true;
+                        self.open_radial(
+                            h,
+                            ctrl,
+                            Some(point),
+                            action.as_ref(),
+                            eye,
+                            now,
+                            RadialSource::LongPress,
+                        );
+                        continue;
+                    }
+                    if hold.action.is_none() && !hold.fired {
+                        let dx = vec3_dot(
+                            displacement,
+                            quat_rotate_vec3(pose.orientation, [1.0, 0.0, 0.0]),
+                        );
+                        if dx.abs() > 0.09 {
+                            hold.fired = true;
+                            self.step_page(if dx < 0.0 { 1 } else { -1 });
+                            self.pending_haptics[h] = Some(HapticEvent::HoverTick);
+                        }
+                    }
+                }
+                if let (Some(drag), Some(point)) = (&mut self.drag_session, point) {
+                    if drag.hand == h
+                        && !drag.via_squeeze
+                        && vec3_len(vec3_sub(point, drag.start_point)) > 0.042
+                    {
+                        drag.active_drag = true;
+                    }
+                }
+            }
+            if up {
+                if self
+                    .drag_session
+                    .as_ref()
+                    .is_some_and(|d| d.hand == h && !d.via_squeeze)
+                {
+                    self.finish_drag_drop(action.clone());
+                }
+                self.press_hold[h] = None;
+            }
+            if grip_down {
+                match action {
+                    Some(HitAction::SelectEntry(idx)) => {
                         if !self.selected_entry_indices.contains(&idx) {
                             self.select_single(idx);
                         }
-                        let paths = self.selected_paths();
-                        if !paths.is_empty() && self.current_location != TRASH_URI {
-                            self.drag_session = Some(DragSession {
-                                hand: h,
-                                primary_label: short_display_stem(&self.all_entries[idx]),
-                                source_paths: paths,
-                                start_point: p.hit_point,
-                                active_drag: true,
-                            });
-                            self.pending_haptics[h] = Some(HapticEvent::GrabStart);
-                        }
-                    } else {
+                        self.begin_drag(h, pick.unwrap().hit_point, true, false);
+                    }
+                    Some(HitAction::GrabPocket) => {
+                        self.begin_drag(h, pick.unwrap().hit_point, true, true)
+                    }
+                    _ if !self.embedded_panel => {
                         self.workspace_grab = Some(WorkspaceGrab {
                             hand: h,
                             start_ray_dir: ctrl.aim_dir,
                             base_yaw: self.anchor_yaw,
-                            via_trigger: false,
-                        });
-                        self.pending_haptics[h] = Some(HapticEvent::GrabStart);
+                        })
                     }
-                } else {
-                    self.workspace_grab = Some(WorkspaceGrab {
-                        hand: h,
-                        start_ray_dir: ctrl.aim_dir,
-                        base_yaw: self.anchor_yaw,
-                        via_trigger: false,
-                    });
-                    self.pending_haptics[h] = Some(HapticEvent::GrabStart);
+                    _ => {}
                 }
             }
-
-            if let Some(ref grab) = self.workspace_grab {
-                let held = if grab.via_trigger {
-                    ctrl.trigger_pressed
-                } else {
-                    ctrl.squeeze_pressed
-                };
-                if grab.hand == h && held {
-                    let yaw0 = (-grab.start_ray_dir[0]).atan2(-grab.start_ray_dir[2]);
-                    let yaw1 = (-ctrl.aim_dir[0]).atan2(-ctrl.aim_dir[2]);
-                    self.anchor_yaw = grab.base_yaw + (yaw1 - yaw0);
-                    if ctrl.stick[1].abs() > 0.18 {
-                        self.workspace_radius =
-                            (self.workspace_radius - ctrl.stick[1] * 1.15 * dt).clamp(1.00, 2.80);
-                    }
+            if let Some(grab) = &self.workspace_grab {
+                if grab.hand == h && ctrl.squeeze_pressed {
+                    self.anchor_yaw =
+                        grab.base_yaw + ray_yaw_delta(grab.start_ray_dir, ctrl.aim_dir);
+                    self.workspace_radius =
+                        (self.workspace_radius - ctrl.stick[1] * dt).clamp(1.0, 2.8);
                 }
             }
-            if sqz_just_up {
+            if grip_up {
                 if self
-                    .workspace_grab
+                    .drag_session
                     .as_ref()
-                    .is_some_and(|g| g.hand == h && !g.via_trigger)
+                    .is_some_and(|d| d.hand == h && d.via_squeeze)
                 {
-                    self.workspace_grab = None;
+                    self.finish_drag_drop(action.clone());
                 }
-                if self.drag_session.as_ref().is_some_and(|d| d.hand == h) {
-                    self.finish_drag_drop(pick.map(|p| p.index));
-                }
+                self.workspace_grab = None;
             }
-
             if self.workspace_grab.is_none() && now >= self.stick_cooldown_until[h] {
-                let sy = ctrl.stick[1];
-                let sx = ctrl.stick[0];
-                if sy <= -0.62 || sx >= 0.65 {
-                    self.step_page(1);
-                    self.stick_cooldown_until[h] = now + Duration::from_millis(260);
-                } else if sy >= 0.62 || sx <= -0.65 {
-                    self.step_page(-1);
-                    self.stick_cooldown_until[h] = now + Duration::from_millis(260);
-                }
-            }
-
-            if trig_just_down {
-                if let Some(p) = pick {
-                    if let Some(action) = self.hit_actions.get(p.index).cloned() {
-                        self.pending_haptics[h] = Some(HapticEvent::PrimaryClick);
-                        self.execute_hit_press(h, action, p.hit_point, ctrl.aim_dir, now);
-                    }
+                let d = if ctrl.stick[1] < -0.62 || ctrl.stick[0] > 0.65 {
+                    1
+                } else if ctrl.stick[1] > 0.62 || ctrl.stick[0] < -0.65 {
+                    -1
                 } else {
-                    self.context_menu = None;
-                }
-            } else if ctrl.trigger_pressed {
-                if let Some(ref mut drag) = self.drag_session {
-                    if drag.hand == h && !drag.active_drag {
-                        let cur_pt = pick.map(|p| p.hit_point).unwrap_or_else(|| {
-                            vec3_add(ctrl.aim_origin, vec3_scale(ctrl.aim_dir, 1.25))
-                        });
-                        if vec3_len(vec3_sub(cur_pt, drag.start_point)) > 0.042 {
-                            drag.active_drag = true;
-                            self.pending_haptics[h] = Some(HapticEvent::GrabStart);
-                        }
-                    }
-                }
-            } else if trig_just_up {
-                if self
-                    .workspace_grab
-                    .as_ref()
-                    .is_some_and(|g| g.hand == h && g.via_trigger)
-                {
-                    self.workspace_grab = None;
-                }
-                if self.drag_session.as_ref().is_some_and(|d| d.hand == h) {
-                    self.finish_drag_drop(pick.map(|p| p.index));
+                    0
+                };
+                if d != 0 {
+                    self.step_page(d);
+                    self.stick_cooldown_until[h] = now + Duration::from_millis(260);
                 }
             }
         }
+    }
+
+    fn begin_drag(&mut self, hand: usize, point: [f32; 3], via_squeeze: bool, from_pocket: bool) {
+        let paths = if from_pocket {
+            self.drop_pocket.clone()
+        } else {
+            self.selected_paths()
+        };
+        if paths.is_empty() || self.current_location == TRASH_URI {
+            return;
+        }
+        self.drag_session = Some(DragSession {
+            hand,
+            primary_label: format!("{} 项", paths.len()),
+            source_paths: paths,
+            start_point: point,
+            active_drag: via_squeeze,
+            via_squeeze,
+            from_pocket,
+        });
+    }
+
+    fn open_radial(
+        &mut self,
+        hand: usize,
+        ctrl: HandControllerInput,
+        hit: Option<[f32; 3]>,
+        action: Option<&HitAction>,
+        eye: [f32; 3],
+        now: Instant,
+        source: RadialSource,
+    ) {
+        let on_entry = match action {
+            Some(HitAction::SelectEntry(idx) | HitAction::QuickLookEntry(idx)) => {
+                self.select_single(*idx);
+                true
+            }
+            _ => self.quick_look_open && self.primary_selected.is_some(),
+        };
+        if !on_entry {
+            self.selected_entry_indices.clear();
+            self.primary_selected = None;
+        }
+        let distance = hit
+            .map(|p| vec3_len(vec3_sub(p, ctrl.aim_origin)))
+            .unwrap_or(1.24);
+        let anchor = vec3_add(
+            ctrl.aim_origin,
+            vec3_scale(ctrl.aim_dir, (distance - 0.12).max(0.35)),
+        );
+        self.radial_menu = Some(RadialMenuState {
+            hand,
+            anchor_world: anchor,
+            center_ray_dir: ctrl.aim_dir,
+            opened_at: now,
+            latched_open: false,
+            active_sector: None,
+            orientation: user_facing_orientation(anchor, eye),
+            source,
+            on_entry,
+            sort_hidden: false,
+        });
+        self.drag_session = None;
+        self.pending_haptics[hand] = Some(HapticEvent::ContextMenu);
+    }
+
+    fn radial_sector_enabled(&self, sector: usize) -> bool {
+        self.current_location != TRASH_URI || matches!(sector, 1 | 3 | 4)
+    }
+
+    fn execute_radial_sector(&mut self, sector: usize, on_entry: bool, hidden: bool) {
+        if !self.radial_sector_enabled(sector) {
+            return;
+        }
+        match sector {
+            0 => self.open_selected(
+                self.primary_selected
+                    .is_some_and(|i| self.all_entries[i].kind == FileKind::Video),
+            ),
+            1 => {
+                self.quick_look_open = self.primary_selected.is_some();
+            }
+            2 if on_entry => self.stash_selected(),
+            2 => {
+                if let Err(e) = self.deploy_pocket() {
+                    self.status_message = e.to_string();
+                }
+            }
+            3 => {
+                if let Err(e) = self.trash_or_restore_selected() {
+                    self.status_message = e.to_string();
+                }
+            }
+            4 => {
+                if hidden {
+                    self.show_hidden = !self.show_hidden;
+                } else {
+                    self.sort_by = self.sort_by.next();
+                }
+                self.reload_directory();
+            }
+            5 => self.start_prompt(if on_entry {
+                PromptMode::Rename
+            } else {
+                PromptMode::NewFolder
+            }),
+            _ => {}
+        }
+    }
+
+    fn start_prompt(&mut self, mode: PromptMode) {
+        self.quick_look_open = false;
+        self.prompt_mode = Some(mode);
+        self.prompt_buffer = match mode {
+            PromptMode::Search => self.search_query.clone(),
+            PromptMode::NewFolder => "新建文件夹".into(),
+            PromptMode::Rename => self
+                .primary_selected
+                .and_then(|i| self.all_entries.get(i))
+                .map(|e| e.name.clone())
+                .unwrap_or_default(),
+        };
     }
 
     fn execute_hit_press(
         &mut self,
         hand: usize,
         action: HitAction,
-        hit_point: [f32; 3],
-        ray_dir: [f32; 3],
+        point: [f32; 3],
+        dir: [f32; 3],
         now: Instant,
     ) {
+        self.pending_haptics[hand] = Some(HapticEvent::PrimaryClick);
         match action {
-            HitAction::GrabWorkspaceBar => {
-                self.workspace_grab = Some(WorkspaceGrab {
-                    hand,
-                    start_ray_dir: ray_dir,
-                    base_yaw: self.anchor_yaw,
-                    via_trigger: true,
+            HitAction::SelectEntry(idx) => {
+                let double = self.last_click[hand].as_ref().is_some_and(|last| {
+                    last.entry_index == idx
+                        && now.saturating_duration_since(last.at) >= Duration::from_millis(35)
+                        && now.saturating_duration_since(last.at) <= Duration::from_millis(480)
+                        && angle_between(last.ray_dir, dir) <= 2.5f32.to_radians()
                 });
-            }
-            HitAction::SelectEntry(entry_idx) => {
-                self.context_menu = None;
-                let is_double = self.last_click[hand].as_ref().is_some_and(|prev| {
-                    let dt = now.duration_since(prev.at);
-                    let cos_ang = vec3_dot(prev.ray_dir, ray_dir).clamp(-1.0, 1.0);
-                    prev.entry_index == entry_idx
-                        && dt >= Duration::from_millis(35)
-                        && dt <= Duration::from_millis(450)
-                        && cos_ang.acos() <= 1.6f32.to_radians()
-                });
-                if is_double {
+                self.select_single(idx);
+                if double {
                     self.last_click[hand] = None;
                     self.drag_session = None;
-                    self.select_single(entry_idx);
                     self.open_selected(false);
-                    return;
-                }
-                self.last_click[hand] = Some(ClickStamp {
-                    entry_index: entry_idx,
-                    ray_dir,
-                    at: now,
-                });
-                self.select_single(entry_idx);
-                if self.current_location != TRASH_URI {
-                    let paths = self.selected_paths();
-                    if !paths.is_empty() {
-                        self.drag_session = Some(DragSession {
-                            hand,
-                            primary_label: short_display_stem(&self.all_entries[entry_idx]),
-                            source_paths: paths,
-                            start_point: hit_point,
-                            active_drag: false,
-                        });
-                    }
+                } else {
+                    self.last_click[hand] = Some(ClickStamp {
+                        entry_index: idx,
+                        ray_dir: dir,
+                        at: now,
+                    });
+                    self.begin_drag(hand, point, false, false);
                 }
             }
-            HitAction::NavigateLocation(loc) => self.navigate_to(loc),
-            HitAction::ToggleView(mode) => self.set_view_mode(mode),
-            HitAction::CycleSort => {
-                self.sort_by = self.sort_by.next();
-                self.reload_directory();
+            HitAction::QuickLookEntry(idx) => {
+                self.select_single(idx);
+                self.quick_look_open = true;
             }
-            HitAction::ToggleHidden => {
-                self.show_hidden = !self.show_hidden;
-                self.reload_directory();
-            }
-            HitAction::PageDelta(d) => self.step_page(d),
-            HitAction::NavigateUp => self.navigate_up(),
+            HitAction::NavigateLocation(path) => self.navigate_to(path),
             HitAction::NavigateBack => {
-                if let Some(prev) = self.back_stack.pop() {
+                if let Some(previous) = self.back_stack.pop() {
                     self.forward_stack.push(self.current_location.clone());
-                    self.current_location = prev;
+                    self.current_location = previous;
+                    self.quick_look_open = false;
                     self.page = 0;
                     self.reload_directory();
+                } else {
+                    self.navigate_up();
                 }
             }
-            HitAction::StartPrompt(mode) => {
-                self.prompt_mode = Some(mode);
-                self.prompt_buffer = match mode {
-                    PromptMode::Search => self.search_query.clone(),
-                    PromptMode::NewFolder => "新建文件夹".into(),
-                    PromptMode::Rename => self
-                        .primary_selected
-                        .and_then(|i| self.all_entries.get(i))
-                        .map(|e| e.name.clone())
-                        .unwrap_or_default(),
-                };
-            }
-            HitAction::ClearSearch => {
-                self.prompt_mode = None;
-                self.prompt_buffer.clear();
-                self.set_search_query(String::new());
-            }
+            HitAction::ToggleView(mode) => self.set_view_mode(mode),
+            HitAction::PageDelta(delta) => self.step_page(delta),
+            HitAction::StartPrompt(mode) => self.start_prompt(mode),
             HitAction::PromptBackspace => self.handle_backspace(),
             HitAction::PromptCommit => self.commit_prompt(),
-            HitAction::PromptCancel => self.prompt_mode = None,
-            HitAction::InspectorOpen { cinema } => self.open_selected(cinema),
+            HitAction::PromptCancel => {
+                self.prompt_mode = None;
+            }
+            HitAction::InspectorOpen => self.open_selected(
+                self.primary_selected
+                    .is_some_and(|i| self.all_entries[i].kind == FileKind::Video),
+            ),
             HitAction::InspectorTrashOrRestore => {
                 let _ = self.trash_or_restore_selected();
-            }
-            HitAction::OpenContextMenuHere => {
-                self.context_menu = Some(ContextMenuState {
-                    anchor_world: hit_point,
-                });
             }
             HitAction::UndoLast => {
                 let _ = self.undo_last();
             }
-            HitAction::RecenterWorkspace => self.request_recenter(),
-            HitAction::ContextAction(op) => {
-                self.context_menu = None;
-                match op {
-                    ContextMenuOp::Open => self.open_selected(false),
-                    ContextMenuOp::OpenCinema => self.open_selected(true),
-                    ContextMenuOp::Copy => self.copy_selected_to_clipboard(ClipboardOp::Copy),
-                    ContextMenuOp::Cut => self.copy_selected_to_clipboard(ClipboardOp::Cut),
-                    ContextMenuOp::Paste => {
-                        let _ = self.paste_clipboard_here();
-                    }
-                    ContextMenuOp::NewFolder => {
-                        let _ = self.create_folder_named("新建文件夹");
-                    }
-                    ContextMenuOp::Rename => {
-                        if let Some(idx) = self.primary_selected {
-                            self.prompt_mode = Some(PromptMode::Rename);
-                            self.prompt_buffer = self.all_entries[idx].name.clone();
-                        }
-                    }
-                    ContextMenuOp::TrashOrRestore => {
-                        let _ = self.trash_or_restore_selected();
-                    }
-                    ContextMenuOp::Close => {}
+            HitAction::StashSelected => self.stash_selected(),
+            HitAction::GrabPocket => self.begin_drag(hand, point, false, true),
+            HitAction::DeployPocket => {
+                if let Err(e) = self.deploy_pocket() {
+                    self.status_message = e.to_string();
                 }
+            }
+            HitAction::ClearPocket => {
+                self.drop_pocket.clear();
+            }
+            HitAction::QuickLookClose => {
+                self.quick_look_open = false;
+                self.holo_orbit_drag = None;
+            }
+            HitAction::OrbitModel => {
+                self.holo_orbit_drag = Some((hand, dir, self.holo_yaw_pitch));
+            }
+            HitAction::RadialSector(sector) => {
+                if let Some(menu) = self.radial_menu.take() {
+                    self.execute_radial_sector(sector, menu.on_entry, menu.sort_hidden);
+                }
+            }
+            HitAction::DismissRadial => {
+                self.radial_menu = None;
             }
         }
     }
 
-    fn finish_drag_drop(&mut self, drop_hit_idx: Option<usize>) {
-        let Some(drag) = self.drag_session.take() else {
+    fn finish_drag_drop(&mut self, action: Option<HitAction>) {
+        let Some(drag) = self.drag_session.take().filter(|d| d.active_drag) else {
             return;
         };
-        if !drag.active_drag {
+        if drag.from_pocket {
+            if matches!(
+                action,
+                None | Some(HitAction::SelectEntry(_) | HitAction::DeployPocket)
+            ) {
+                if let Err(e) = self.deploy_pocket() {
+                    self.status_message = e.to_string();
+                }
+            }
             return;
         }
-        let Some(hit_idx) = drop_hit_idx else {
+        if matches!(
+            action,
+            Some(HitAction::GrabPocket | HitAction::DeployPocket)
+        ) {
+            self.stash_paths(drag.source_paths);
             return;
-        };
-        let Some(action) = self.hit_actions.get(hit_idx).cloned() else {
-            return;
-        };
-        let target_result = match action {
-            HitAction::SelectEntry(idx) => self
+        }
+        let destination = match action {
+            Some(HitAction::SelectEntry(i)) => self
                 .all_entries
-                .get(idx)
+                .get(i)
                 .filter(|e| e.kind == FileKind::Directory)
-                .map(|e| e.path.to_string_lossy().into_owned()),
-            HitAction::NavigateLocation(loc) => Some(loc),
+                .map(|e| e.path.clone()),
+            Some(HitAction::NavigateLocation(path)) if path != TRASH_URI => {
+                Some(PathBuf::from(path))
+            }
             _ => None,
         };
-        if let Some(dest) = target_result {
-            if dest == TRASH_URI {
-                if let Ok(undo) = fs_ops::trash_paths(&drag.source_paths) {
+        if let Some(dest) = destination {
+            match fs_ops::move_paths_to_dir(&drag.source_paths, &dest) {
+                Ok(undo) => {
                     self.undo_stack.push(undo);
                     self.reload_directory();
                 }
-            } else if let Ok(undo) = fs_ops::move_paths_to_dir(&drag.source_paths, Path::new(&dest))
-            {
-                self.undo_stack.push(undo);
-                self.reload_directory();
+                Err(e) => self.status_message = e.to_string(),
             }
         }
     }
 
-    // ========================================================================
-    // Icon-First + Visual Gallery Scene Builders
-    // ========================================================================
-
-    fn register_hit(&mut self, center: [f32; 3], half_ext: [f32; 3], action: HitAction) -> usize {
-        let min = [
-            center[0] - half_ext[0],
-            center[1] - half_ext[1],
-            center[2] - half_ext[2],
-        ];
-        let max = [
-            center[0] + half_ext[0],
-            center[1] + half_ext[1],
-            center[2] + half_ext[2],
-        ];
-        let idx = self.hit_batch.push(min, max, HIT_SLOP_RAD);
+    fn register_hit(&mut self, center: [f32; 3], half: [f32; 3], action: HitAction) -> usize {
+        if (self.radial_menu.is_some() && self.hit_layer != InputLayer::Radial)
+            || (self.quick_look_open && self.hit_layer == InputLayer::Shelf)
+        {
+            return usize::MAX;
+        }
+        let min = vec3_sub(center, half);
+        let max = vec3_add(center, half);
+        let index = self.hit_batch.push(min, max, HIT_SLOP_RAD);
         self.hit_actions.push(action);
-        idx
+        index
     }
 
-    fn is_hit_hovered(&self, hit_index: usize) -> bool {
-        self.hovered_hit[0] == Some(hit_index) || self.hovered_hit[1] == Some(hit_index)
+    fn is_hit_hovered(&self, index: usize) -> bool {
+        self.hovered_hit.contains(&Some(index))
     }
 
-    /// Top Parent Depth Orb: pure `[ ↑ ]` icon pill peeking gently behind top edge;
-    /// parent name appears ONLY on hover!
-    fn emit_depth_breadcrumbs(
-        &mut self,
-        scene: &mut FrameScene,
-        yaw_deg: f32,
-        eye_center: [f32; 3],
-        glyphs: &mut GlyphAtlas,
-    ) {
-        if self.current_location == TRASH_URI {
-            return;
-        }
-        let Some(parent) = Path::new(&self.current_location).parent() else {
-            return;
-        };
-        let pose = arc_panel_pose(
-            self.anchor_pos,
-            self.anchor_yaw,
-            yaw_deg,
-            0.398,
-            self.workspace_radius + 0.08,
-            eye_center,
-        );
-        let parent_name = parent
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "/".into());
-        self.emit_icon_orb(
-            scene,
-            &pose,
-            [0.0, 0.0, 0.0],
-            0.036,
-            UiIcon::UpArrow,
-            HitAction::NavigateLocation(parent.to_string_lossy().into_owned()),
-            false,
-            true,
-            Some(&parent_name),
-            glyphs,
-        );
-    }
-
-    fn emit_main_qingkong_window(
-        &mut self,
-        scene: &mut FrameScene,
-        yaw_deg: f32,
-        eye_center: [f32; 3],
-        hands: &[HandControllerInput; 2],
-        glyphs: &mut GlyphAtlas,
-    ) {
-        let win = if self.embedded_panel {
-            Pose3D {
-                position: [-0.242, 1.60, -1.24],
-                orientation: [0.0, 0.0, 0.0, 1.0],
-            }
-        } else {
-            arc_panel_pose(
-                self.anchor_pos,
-                self.anchor_yaw,
-                yaw_deg,
-                -0.01,
-                self.workspace_radius,
-                eye_center,
-            )
-        };
-        let win_w = 1.28f32;
-        let win_h = 0.76f32;
-
-        if !self.embedded_panel {
-            push_panel_shadow(
-                &mut scene.quads,
-                &win,
-                [0.0, -0.010, -0.012],
-                [win_w, win_h],
-                0.034,
-                0.036,
-                0.075,
-            );
-        }
-        push_panel_glass(
-            &mut scene.quads,
-            &win,
-            [0.0, 0.0, 0.0],
-            [win_w, win_h],
-            0.034,
-            if self.embedded_panel {
-                qk_rgba(236, 244, 252, 0.84)
-            } else {
-                col_glass_window()
-            },
-            col_rim_luminous(),
-        );
-
-        // ====================================================================
-        // Icon-First Minimalist Header Row (Zero text-button clutter!)
-        // ====================================================================
-        if self.embedded_panel {
-            // In HyperSpace coexisting mode, Shell owns the bottom companion bar,
-            // so place crisp `←` Back and `↑` Parent orbs right in the header!
-            self.emit_icon_orb(
-                scene,
-                &win,
-                [-0.590, 0.328, 0.006],
-                0.032,
-                UiIcon::BackLeft,
-                HitAction::NavigateBack,
-                false,
-                false,
-                Some("返回"),
-                glyphs,
-            );
-            self.emit_icon_orb(
-                scene,
-                &win,
-                [-0.550, 0.328, 0.006],
-                0.032,
-                UiIcon::UpArrow,
-                HitAction::NavigateUp,
-                false,
-                false,
-                Some("上层"),
-                glyphs,
-            );
-            if self.page_count() > 1 {
-                self.emit_icon_orb(
-                    scene,
-                    &win,
-                    [0.240, 0.328, 0.006],
-                    0.030,
-                    UiIcon::ChevronLeft,
-                    HitAction::PageDelta(-1),
-                    false,
-                    false,
-                    None,
-                    glyphs,
-                );
-                self.emit_icon_orb(
-                    scene,
-                    &win,
-                    [0.276, 0.328, 0.006],
-                    0.030,
-                    UiIcon::ChevronRight,
-                    HitAction::PageDelta(1),
-                    false,
-                    false,
-                    None,
-                    glyphs,
-                );
-            }
-        }
-        let header_folder_x = if self.embedded_panel { -0.506 } else { -0.578 };
-        let header_title_x = if self.embedded_panel { -0.472 } else { -0.542 };
-        push_textured_quad(
-            &mut scene.quads,
-            &win,
-            [header_folder_x, 0.328, 0.005],
-            [0.036, 0.036],
-            0.006,
-            2,
-            0.0,
-        );
-        let dir_short = if self.current_location == TRASH_URI {
-            "回收站".to_string()
-        } else {
-            Path::new(&self.current_location)
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "/".into())
-        };
-        push_panel_text(
-            &mut scene.quads,
-            &win,
-            [header_title_x, 0.320, 0.006],
-            &dir_short,
-            0.021,
-            0.19,
-            col_ink_navy(),
-            FontWeight::Bold,
-            glyphs,
-        );
-
-        // Sleek Icon-First Search Capsule (`🔍` icon only when idle — zero placeholder prose!)
-        let search_cx = -0.045f32;
-        let search_w = if self.prompt_mode.is_some() || !self.search_query.is_empty() {
-            0.40f32
-        } else {
-            0.22f32
-        };
-        let search_hit = self.register_hit(
-            vec3_add(
-                win.position,
-                quat_rotate_vec3(win.orientation, [search_cx, 0.328, 0.006]),
-            ),
-            [search_w * 0.5, 0.020, 0.02],
-            HitAction::StartPrompt(PromptMode::Search),
-        );
-        let search_hov = self.is_hit_hovered(search_hit);
-        push_panel_glass(
-            &mut scene.quads,
-            &win,
-            [search_cx, 0.328, 0.005],
-            [search_w, 0.036],
-            0.018,
-            if self.prompt_mode.is_some() || search_hov {
-                qk_rgba(255, 255, 255, 0.88)
-            } else {
-                qk_rgba(255, 255, 255, 0.46)
-            },
-            [1.0, 1.0, 1.0, 0.55],
-        );
-
-        let prompt_icon = match self.prompt_mode {
-            Some(PromptMode::NewFolder) => UiIcon::NewFolder,
-            Some(PromptMode::Rename) => UiIcon::EditRename,
-            _ => UiIcon::Search,
-        };
-        push_ui_icon(
-            &mut scene.quads,
-            &win,
-            [search_cx - search_w * 0.5 + 0.022, 0.328, 0.008],
-            0.019,
-            prompt_icon,
-            if self.prompt_mode.is_some() || !self.search_query.is_empty() {
-                col_kylin_blue()
-            } else {
-                col_muted_slate()
-            },
-        );
-
-        if self.prompt_mode.is_some() {
-            push_panel_text(
-                &mut scene.quads,
-                &win,
-                [search_cx - search_w * 0.5 + 0.040, 0.321, 0.008],
-                &format!("{}▌", self.prompt_buffer),
-                0.0155,
-                search_w - 0.055,
-                col_ink_navy(),
-                FontWeight::Bold,
-                glyphs,
-            );
-            // Pure icon orbs for Backspace, Check, Cancel (zero words!)
-            self.emit_icon_orb(
-                scene,
-                &win,
-                [search_cx + search_w * 0.5 + 0.026, 0.328, 0.007],
-                0.032,
-                UiIcon::BackLeft,
-                HitAction::PromptBackspace,
-                false,
-                false,
-                None,
-                glyphs,
-            );
-            self.emit_icon_orb(
-                scene,
-                &win,
-                [search_cx + search_w * 0.5 + 0.064, 0.328, 0.007],
-                0.032,
-                UiIcon::CheckMark,
-                HitAction::PromptCommit,
-                true,
-                true,
-                None,
-                glyphs,
-            );
-            self.emit_icon_orb(
-                scene,
-                &win,
-                [search_cx + search_w * 0.5 + 0.102, 0.328, 0.007],
-                0.032,
-                UiIcon::CloseCross,
-                HitAction::PromptCancel,
-                false,
-                false,
-                None,
-                glyphs,
-            );
-        } else if !self.search_query.is_empty() {
-            push_panel_text(
-                &mut scene.quads,
-                &win,
-                [search_cx - search_w * 0.5 + 0.040, 0.321, 0.008],
-                &self.search_query,
-                0.0155,
-                search_w - 0.080,
-                col_ink_navy(),
-                FontWeight::Bold,
-                glyphs,
-            );
-            self.emit_icon_orb(
-                scene,
-                &win,
-                [search_cx + search_w * 0.5 - 0.020, 0.328, 0.008],
-                0.026,
-                UiIcon::CloseCross,
-                HitAction::ClearSearch,
-                false,
-                false,
-                None,
-                glyphs,
-            );
-        }
-
-        // Pure-Icon View Switcher Pill (`⊞` Gallery | `⬡` 3D Treemap) + Pure-Icon Action Strip!
-        push_panel_glass(
-            &mut scene.quads,
-            &win,
-            [0.346, 0.328, 0.005],
-            [0.088, 0.036],
-            0.018,
-            qk_rgba(255, 255, 255, 0.44),
-            [1.0, 1.0, 1.0, 0.50],
-        );
-        self.emit_icon_orb(
-            scene,
-            &win,
-            [0.325, 0.328, 0.007],
-            0.032,
-            UiIcon::GridView,
-            HitAction::ToggleView(ViewMode::Workbench),
-            self.view_mode == ViewMode::Workbench,
-            false,
-            Some("画廊"),
-            glyphs,
-        );
-        self.emit_icon_orb(
-            scene,
-            &win,
-            [0.367, 0.328, 0.007],
-            0.032,
-            UiIcon::Cube3DView,
-            HitAction::ToggleView(ViewMode::Treemap3D),
-            self.view_mode == ViewMode::Treemap3D,
-            false,
-            Some("3D 星图"),
-            glyphs,
-        );
-
-        self.emit_icon_orb(
-            scene,
-            &win,
-            [0.432, 0.328, 0.006],
-            0.034,
-            UiIcon::NewFolder,
-            HitAction::StartPrompt(PromptMode::NewFolder),
-            false,
-            false,
-            Some("新建"),
-            glyphs,
-        );
-        self.emit_icon_orb(
-            scene,
-            &win,
-            [0.480, 0.328, 0.006],
-            0.034,
-            UiIcon::Sort,
-            HitAction::CycleSort,
-            false,
-            false,
-            Some(self.sort_by.label_zh()),
-            glyphs,
-        );
-        if !self.undo_stack.is_empty() {
-            self.emit_icon_orb(
-                scene,
-                &win,
-                [0.528, 0.328, 0.006],
-                0.034,
-                UiIcon::UndoCurved,
-                HitAction::UndoLast,
-                true,
-                false,
-                Some("撤销"),
-                glyphs,
-            );
-        } else {
-            self.emit_icon_orb(
-                scene,
-                &win,
-                [0.528, 0.328, 0.006],
-                0.034,
-                UiIcon::EyeHidden,
-                HitAction::ToggleHidden,
-                self.show_hidden,
-                false,
-                Some("隐藏项"),
-                glyphs,
-            );
-        }
-        self.emit_icon_orb(
-            scene,
-            &win,
-            [0.576, 0.328, 0.006],
-            0.034,
-            UiIcon::MoreDots,
-            HitAction::OpenContextMenuHere,
-            false,
-            false,
-            Some("更多"),
-            glyphs,
-        );
-
-        // ====================================================================
-        // Left Spatial Icon Dock (`x = -0.575` — Pure Icons, Zero Text Column!)
-        // ====================================================================
-        let bookmarks = self.bookmarks.clone();
-        for (i, bm) in bookmarks.iter().take(8).enumerate() {
-            let ly = 0.228 - (i as f32) * 0.058;
-            let active = self.current_location == bm.target;
-            let ui_icon = UiIcon::from_bookmark_tag(&bm.icon_tag);
-            self.emit_sidebar_icon_dock_slot(
-                scene,
-                &win,
-                [-0.575, ly, 0.006],
-                ui_icon,
-                &bm.label,
-                HitAction::NavigateLocation(bm.target.clone()),
-                active,
-                glyphs,
-            );
-        }
-
-        // Storage Drive Icon + Sleek Capacity Gauge (Zero permanent text!)
-        if let Some(vol) = self.volumes.first().cloned() {
-            let used = vol.total_bytes.saturating_sub(vol.free_bytes);
-            let ratio = (used as f32 / vol.total_bytes.max(1) as f32).clamp(0.10, 1.0);
-            push_ui_icon(
-                &mut scene.quads,
-                &win,
-                [-0.575, -0.275, 0.006],
-                0.021,
-                UiIcon::StorageDrive,
-                col_muted_slate(),
-            );
-            push_panel_glass(
-                &mut scene.quads,
-                &win,
-                [-0.575, -0.304, 0.005],
-                [0.046, 0.0055],
-                0.0028,
-                qk_rgba(205, 218, 236, 0.65),
-                [0.0; 4],
-            );
-            let fw = 0.046 * ratio;
-            push_panel_glass(
-                &mut scene.quads,
-                &win,
-                [-0.598 + 0.5 * fw, -0.304, 0.007],
-                [fw, 0.0055],
-                0.0028,
-                col_kylin_blue(),
-                [0.0; 4],
-            );
-        }
-
-        // ====================================================================
-        // Expanded Warm Visual Content Canvas (`x in -0.515..+0.615`, `well_w = 1.13m`)
-        // ====================================================================
-        let well_cx = 0.050f32;
-        let well_cy = -0.025f32;
-        let well_w = 1.13f32;
-        let well_h = 0.65f32;
-        push_panel_glass(
-            &mut scene.quads,
-            &win,
-            [well_cx, well_cy, 0.002],
-            [well_w, well_h],
-            0.026,
-            col_content_canvas(),
-            [1.0, 1.0, 1.0, 0.42],
-        );
-
-        match self.view_mode {
-            ViewMode::Workbench => {
-                self.emit_visual_gallery_workbench(scene, &win, well_cx, hands, glyphs);
-            }
-            ViewMode::Treemap3D => {
-                self.emit_qingkong_treemap_3d(scene, &win, well_cx, eye_center, glyphs);
-            }
-        }
-    }
-
-    /// Renders:
-    /// 1. Unobstructed **16:9 Panoramic Hero Media Showcase Strip** (corner icon badges; text only on select/hover!)
-    /// 2. Deduplicated **4 × 2 Visual File & Golden Folder Grid** (concise single-word stems, zero subtitle prose!)
-    fn emit_visual_gallery_workbench(
-        &mut self,
-        scene: &mut FrameScene,
-        win: &Pose3D,
-        well_cx: f32,
-        hands: &[HandControllerInput; 2],
-        glyphs: &mut GlyphAtlas,
-    ) {
-        if self.filtered_indices.is_empty() {
-            push_ui_icon(
-                &mut scene.quads,
-                win,
-                [well_cx, 0.01, 0.012],
-                0.055,
-                UiIcon::Search,
-                qk_rgba(120, 140, 170, 0.55),
-            );
-            return;
-        }
-
-        let hero_entries = self.hero_entry_indices();
-        let grid_entries = self.grid_entry_indices(&hero_entries);
-        let has_hero = !hero_entries.is_empty();
-
-        if has_hero {
-            let hero_w = 0.344f32;
-            let hero_h = 0.186f32;
-            let hero_y = if grid_entries.is_empty() {
-                0.04f32
-            } else {
-                0.188f32
-            };
-
-            for (hi, &entry_idx) in hero_entries.iter().enumerate() {
-                let entry = self.all_entries[entry_idx].clone();
-                let lx = well_cx + (hi as f32 - (hero_entries.len() as f32 - 1.0) * 0.5) * 0.362;
-                let slot_anim = 24 + hi;
-                let z_lift = self.slot_z_cur.get(slot_anim).copied().unwrap_or(0.014);
-
-                let world_c = vec3_add(
-                    win.position,
-                    quat_rotate_vec3(win.orientation, [lx, hero_y, 0.006 + z_lift]),
-                );
-                let hit_idx = self.register_hit(
-                    world_c,
-                    [hero_w * 0.5, hero_h * 0.5, 0.022],
-                    HitAction::SelectEntry(entry_idx),
-                );
-                let hovered = self.is_hit_hovered(hit_idx);
-                let pressed = hovered && (hands[0].trigger_pressed || hands[1].trigger_pressed);
-                if slot_anim < self.slot_z_tgt.len() {
-                    self.slot_z_tgt[slot_anim] = if pressed {
-                        0.004
-                    } else if hovered {
-                        0.026
-                    } else {
-                        0.014
-                    };
-                }
-
-                let selected = self.selected_entry_indices.contains(&entry_idx);
-                let cz = 0.006 + z_lift;
-
-                push_panel_shadow(
-                    &mut scene.quads,
-                    win,
-                    [lx, hero_y - 0.005, 0.004],
-                    [hero_w, hero_h],
-                    0.022,
-                    0.020,
-                    if hovered { 0.11 } else { 0.06 },
-                );
-
-                // 100% Edge-to-Edge Unobstructed 16:9 Artwork!
-                let tex_layer = self
-                    .thumb_slot_by_path
-                    .get(&entry.path)
-                    .copied()
-                    .unwrap_or_else(|| icon_slot_for_kind(entry.kind));
-                push_textured_quad(
-                    &mut scene.quads,
-                    win,
-                    [lx, hero_y, cz],
-                    [hero_w, hero_h],
-                    0.022,
-                    2,
-                    tex_layer as f32,
-                );
-
-                if selected || hovered {
-                    push_panel_glass(
-                        &mut scene.quads,
-                        win,
-                        [lx, hero_y, cz + 0.001],
-                        [hero_w, hero_h],
-                        0.022,
-                        [1.0, 1.0, 1.0, 0.0],
-                        if selected {
-                            col_kylin_blue()
-                        } else {
-                            col_pure_white()
-                        },
-                    );
-                }
-
-                // Pure-Icon Type Badge Pill in Top-Right Corner of 16:9 Artwork!
-                let bx = lx + hero_w * 0.5 - 0.026;
-                let by = hero_y + hero_h * 0.5 - 0.026;
-                push_panel_glass(
-                    &mut scene.quads,
-                    win,
-                    [bx, by, cz + 0.003],
-                    [0.030, 0.030],
-                    0.015,
-                    qk_rgba(250, 252, 255, 0.86),
-                    [1.0, 1.0, 1.0, 0.65],
-                );
-                push_ui_icon(
-                    &mut scene.quads,
-                    win,
-                    [bx, by, cz + 0.006],
-                    0.016,
-                    UiIcon::badge_for_kind(entry.kind),
-                    col_ink_navy(),
-                );
-
-                // Show concise stem pill ONLY when selected or hovered — unselected Hero cards are 100% pure imagery!
-                if selected || hovered {
-                    let stem = short_display_stem(&entry);
-                    let pill_w = (0.045 + stem.chars().count() as f32 * 0.017).clamp(0.10, hero_w - 0.03);
-                    let px = lx - hero_w * 0.5 + 0.016 + pill_w * 0.5;
-                    let py = hero_y - hero_h * 0.5 + 0.026;
-                    push_panel_glass(
-                        &mut scene.quads,
-                        win,
-                        [px, py, cz + 0.003],
-                        [pill_w, 0.032],
-                        0.016,
-                        qk_rgba(248, 251, 255, 0.90),
-                        [1.0, 1.0, 1.0, 0.65],
-                    );
-                    push_panel_text(
-                        &mut scene.quads,
-                        win,
-                        [px - pill_w * 0.5 + 0.014, py - 0.0065, cz + 0.006],
-                        &stem,
-                        0.0145,
-                        pill_w - 0.024,
-                        col_ink_navy(),
-                        FontWeight::Bold,
-                        glyphs,
-                    );
-                }
-            }
-        }
-
-        if grid_entries.is_empty() {
-            return;
-        }
-
-        let rows_avail = if has_hero { 2usize } else { 3usize };
-        let per_page = GRID_COLS * rows_avail;
-        let start = (self.page * per_page).min(grid_entries.len());
-        let end = (start + per_page).min(grid_entries.len());
-
-        let card_w = 0.252f32;
-        let card_h = 0.172f32;
-        let top_row_y = if has_hero { -0.028f32 } else { 0.165f32 };
-
-        for slot in 0..(end.saturating_sub(start)) {
-            let entry_idx = grid_entries[start + slot];
-            let entry = self.all_entries[entry_idx].clone();
-            let col = slot % GRID_COLS;
-            let row = slot / GRID_COLS;
-
-            let lx = well_cx + (col as f32 - 1.5) * 0.270;
-            let ly = top_row_y - (row as f32) * 0.190;
-            let z_lift = self.slot_z_cur.get(slot).copied().unwrap_or(0.010);
-
-            let world_c = vec3_add(
-                win.position,
-                quat_rotate_vec3(win.orientation, [lx, ly, 0.006 + z_lift]),
-            );
-            let hit_idx = self.register_hit(
-                world_c,
-                [card_w * 0.5, card_h * 0.5, 0.022],
-                HitAction::SelectEntry(entry_idx),
-            );
-            let hovered = self.is_hit_hovered(hit_idx);
-            let pressed = hovered && (hands[0].trigger_pressed || hands[1].trigger_pressed);
-            if slot < self.slot_z_tgt.len() {
-                self.slot_z_tgt[slot] = if pressed {
-                    0.003
-                } else if hovered {
-                    0.022
-                } else {
-                    0.010
-                };
-            }
-
-            let selected = self.selected_entry_indices.contains(&entry_idx);
-            let cz = 0.006 + z_lift;
-
-            push_panel_shadow(
-                &mut scene.quads,
-                win,
-                [lx, ly - 0.004, 0.004],
-                [card_w, card_h],
-                0.020,
-                0.016,
-                if hovered { 0.085 } else { 0.04 },
-            );
-
-            let border = if selected {
-                col_kylin_blue()
-            } else if hovered {
-                col_pure_white()
-            } else {
-                [1.0, 1.0, 1.0, 0.45]
-            };
-
-            if let Some(&visual_layer) = self.thumb_slot_by_path.get(&entry.path) {
-                // Rich visual card: top 76% is edge-to-edge imagery + corner category icon badge!
-                push_panel_glass(
-                    &mut scene.quads,
-                    win,
-                    [lx, ly, cz],
-                    [card_w, card_h],
-                    0.020,
-                    if selected {
-                        col_card_selected()
-                    } else {
-                        col_card_surface()
-                    },
-                    border,
-                );
-                push_textured_quad(
-                    &mut scene.quads,
-                    win,
-                    [lx, ly + 0.018, cz + 0.002],
-                    [card_w - 0.012, card_h * 0.74],
-                    0.016,
-                    2,
-                    visual_layer as f32,
-                );
-                let bx = lx + card_w * 0.5 - 0.022;
-                let by = ly + card_h * 0.5 - 0.022;
-                push_panel_glass(
-                    &mut scene.quads,
-                    win,
-                    [bx, by, cz + 0.004],
-                    [0.024, 0.024],
-                    0.012,
-                    qk_rgba(250, 252, 255, 0.86),
-                    [0.0; 4],
-                );
-                push_ui_icon(
-                    &mut scene.quads,
-                    win,
-                    [bx, by, cz + 0.006],
-                    0.0135,
-                    UiIcon::badge_for_kind(entry.kind),
-                    col_ink_navy(),
-                );
-            } else {
-                // Sculpted Golden Folder card: airy frosted glass + large golden folder with peeking inner pages!
-                push_panel_glass(
-                    &mut scene.quads,
-                    win,
-                    [lx, ly, cz],
-                    [card_w, card_h],
-                    0.020,
-                    if selected {
-                        col_card_selected()
-                    } else if hovered {
-                        col_card_hover()
-                    } else {
-                        qk_rgba(255, 255, 255, 0.62)
-                    },
-                    border,
-                );
-                let icon_slot = icon_slot_for_kind(entry.kind) as f32;
-                push_textured_quad(
-                    &mut scene.quads,
-                    win,
-                    [lx, ly + 0.018, cz + 0.003],
-                    [0.106, 0.106],
-                    0.004,
-                    2,
-                    icon_slot,
-                );
-            }
-
-            // ONLY a single clean stem title (zero 2nd line of "空间目录" / "66.1 KB" text!)
-            let stem = short_display_stem(&entry);
-            push_panel_text(
-                &mut scene.quads,
-                win,
-                [lx - card_w * 0.42, ly - 0.064, cz + 0.004],
-                &stem,
-                0.0155,
-                card_w * 0.84,
-                col_ink_navy(),
-                FontWeight::Bold,
-                glyphs,
-            );
-        }
-    }
-
-    fn emit_qingkong_treemap_3d(
-        &mut self,
-        scene: &mut FrameScene,
-        win: &Pose3D,
-        well_cx: f32,
-        eye_center: [f32; 3],
-        glyphs: &mut GlyphAtlas,
-    ) {
-        let podium_w = 0.96f32;
-        let podium_d = 0.50f32;
-        if self.treemap_dirty {
-            let visible_entries: Vec<FileEntry> = self
-                .filtered_indices
-                .iter()
-                .filter_map(|&i| self.all_entries.get(i).cloned())
-                .collect();
-            let mut blocks =
-                treemap3d::build_spatial_treemap(&visible_entries, podium_w, podium_d, 36);
-            for b in &mut blocks {
-                b.entry_index = self.filtered_indices[b.entry_index];
-            }
-            self.cached_treemap = blocks;
-            self.treemap_dirty = false;
-        }
-
-        let tray_center = vec3_add(
-            win.position,
-            quat_rotate_vec3(win.orientation, [well_cx, -0.055, 0.16]),
-        );
-        let podium_pose = Pose3D {
-            position: tray_center,
-            orientation: quat_mul(
-                win.orientation,
-                quat_from_yaw_pitch(0.0, 28.0f32.to_radians()),
-            ),
-        };
-
-        push_oriented_box(
-            &mut scene.solid_vertices,
-            &podium_pose,
-            [0.0, -0.012, 0.0],
-            [podium_w * 0.52, 0.010, podium_d * 0.53],
-            qk_rgba(235, 243, 252, 1.0),
-            0.04,
-        );
-
-        let blocks = self.cached_treemap.clone();
-        for (bi, block) in blocks.iter().enumerate() {
-            let entry = self.all_entries[block.entry_index].clone();
-            let lift = self.treemap_lift_cur.get(bi).copied().unwrap_or(0.0);
-            let h_scaled = block.height * 0.82;
-            let local_center = [block.x_center, 0.5 * h_scaled + lift, block.z_center];
-            let world_center = vec3_add(
-                podium_pose.position,
-                quat_rotate_vec3(podium_pose.orientation, local_center),
-            );
-            let hit_idx = self.register_hit(
-                world_center,
-                [
-                    (0.5 * block.width).max(0.022),
-                    (0.5 * h_scaled + 0.01).max(0.022),
-                    (0.5 * block.depth).max(0.022),
-                ],
-                HitAction::SelectEntry(block.entry_index),
-            );
-            let hovered = self.is_hit_hovered(hit_idx);
-            let selected = self.selected_entry_indices.contains(&block.entry_index);
-            if bi < self.treemap_lift_tgt.len() {
-                self.treemap_lift_tgt[bi] = if hovered {
-                    0.020
-                } else if selected {
-                    0.008
-                } else {
-                    0.0
-                };
-            }
-
-            let accent = entry.kind.accent_rgba();
-            push_oriented_box(
-                &mut scene.solid_vertices,
-                &podium_pose,
-                local_center,
-                [0.5 * block.width, 0.5 * h_scaled, 0.5 * block.depth],
-                accent,
-                if hovered { 0.32 } else { 0.05 },
-            );
-
-            if hovered || self.primary_selected == Some(block.entry_index) {
-                let clamped_local = [
-                    block.x_center.clamp(-0.24, 0.20),
-                    0.5 * h_scaled + 0.11,
-                    block.z_center,
-                ];
-                let raw_pos = vec3_add(
-                    podium_pose.position,
-                    quat_rotate_vec3(podium_pose.orientation, clamped_local),
-                );
-                let to_eye = vec3_normalize(vec3_sub(eye_center, raw_pos));
-                let banner_pos = vec3_add(raw_pos, vec3_scale(to_eye, 0.08));
-                let banner_pose = Pose3D {
-                    position: banner_pos,
-                    orientation: user_facing_orientation(banner_pos, eye_center),
-                };
-                push_panel_glass(
-                    &mut scene.quads,
-                    &banner_pose,
-                    [0.0, 0.0, 0.0],
-                    [0.32, 0.042],
-                    0.021,
-                    qk_rgba(255, 255, 255, 0.92),
-                    [1.0, 1.0, 1.0, 0.85],
-                );
-                push_textured_quad(
-                    &mut scene.quads,
-                    &banner_pose,
-                    [-0.132, 0.0, 0.005],
-                    [0.026, 0.026],
-                    0.006,
-                    2,
-                    icon_slot_for_kind(entry.kind) as f32,
-                );
-                let info = format!(
-                    "{} · {:.0}%",
-                    short_display_stem(&entry),
-                    block.weight_ratio * 100.0
-                );
-                push_panel_text(
-                    &mut scene.quads,
-                    &banner_pose,
-                    [-0.108, -0.0068, 0.006],
-                    &info,
-                    0.0155,
-                    0.25,
-                    col_ink_navy(),
-                    FontWeight::Bold,
-                    glyphs,
-                );
-            }
-        }
-    }
-
-    /// Minimalist HyperSpace Bottom Companion Handle:
-    /// Crisp vector SDF icon orbs (`←`, `↑`, `⌖`, `‹`, `›`) + slender HyperSpace Grab Capsule!
-    fn emit_minimal_companion_bar(
-        &mut self,
-        scene: &mut FrameScene,
-        yaw_deg: f32,
-        eye_center: [f32; 3],
-        glyphs: &mut GlyphAtlas,
-    ) {
-        let bar = arc_panel_pose(
-            self.anchor_pos,
-            self.anchor_yaw,
-            yaw_deg,
-            -0.435,
-            self.workspace_radius - 0.01,
-            eye_center,
-        );
-
-        self.emit_icon_orb(
-            scene,
-            &bar,
-            [-0.155, 0.0, 0.0],
-            0.034,
-            UiIcon::BackLeft,
-            HitAction::NavigateBack,
-            false,
-            true,
-            None,
-            glyphs,
-        );
-        self.emit_icon_orb(
-            scene,
-            &bar,
-            [-0.112, 0.0, 0.0],
-            0.034,
-            UiIcon::UpArrow,
-            HitAction::NavigateUp,
-            false,
-            true,
-            None,
-            glyphs,
-        );
-
-        let grab_hit = self.register_hit(
-            bar.position,
-            [0.095, 0.018, 0.02],
-            HitAction::GrabWorkspaceBar,
-        );
-        let grab_hov = self.is_hit_hovered(grab_hit);
-        push_panel_glass(
-            &mut scene.quads,
-            &bar,
-            [0.0, 0.0, if grab_hov { 0.006 } else { 0.0 }],
-            [0.175, 0.024],
-            0.012,
-            qk_rgba(248, 251, 255, if grab_hov { 0.94 } else { 0.72 }),
-            col_rim_luminous(),
-        );
-        push_panel_glass(
-            &mut scene.quads,
-            &bar,
-            [0.0, 0.0, if grab_hov { 0.009 } else { 0.003 }],
-            [0.076, 0.005],
-            0.0025,
-            col_kylin_blue(),
-            [0.0; 4],
-        );
-
-        if self.page_count() > 1 {
-            self.emit_icon_orb(
-                scene,
-                &bar,
-                [0.112, 0.0, 0.0],
-                0.034,
-                UiIcon::ChevronLeft,
-                HitAction::PageDelta(-1),
-                false,
-                true,
-                None,
-                glyphs,
-            );
-            self.emit_icon_orb(
-                scene,
-                &bar,
-                [0.155, 0.0, 0.0],
-                0.034,
-                UiIcon::ChevronRight,
-                HitAction::PageDelta(1),
-                false,
-                true,
-                None,
-                glyphs,
-            );
-        } else {
-            self.emit_icon_orb(
-                scene,
-                &bar,
-                [0.120, 0.0, 0.0],
-                0.034,
-                UiIcon::Recenter,
-                HitAction::RecenterWorkspace,
-                false,
-                true,
-                None,
-                glyphs,
-            );
-        }
-    }
-
-    /// Right Floating Visual Gallery Stage (`空间预览`):
-    /// - Top 70%: Massive full-bleed artwork or rotating 3D stereo hologram
-    /// - Middle: Colorful 2.5D category icon + short name + numeric chip (zero prose!)
-    /// - Bottom: 4 Pure Circular Spatial Icon Orbs (`[▶/↗]` `[✎]` `[❐]` `[🗑]`, zero text buttons!)
-    fn emit_right_gallery_stage(
-        &mut self,
-        scene: &mut FrameScene,
-        yaw_deg: f32,
-        eye_center: [f32; 3],
-        glyphs: &mut GlyphAtlas,
-    ) {
-        let panel = if self.embedded_panel {
-            Pose3D {
-                position: [0.653, 1.60, -1.24],
-                orientation: [0.0, 0.0, 0.0, 1.0],
-            }
-        } else {
-            arc_panel_pose(
-                self.anchor_pos,
-                self.anchor_yaw,
-                yaw_deg,
-                -0.01,
-                self.workspace_radius,
-                eye_center,
-            )
-        };
-        let pw = 0.45f32;
-        let ph = 0.76f32;
-
-        if !self.embedded_panel {
-            push_panel_shadow(
-                &mut scene.quads,
-                &panel,
-                [0.0, -0.010, -0.012],
-                [pw, ph],
-                0.032,
-                0.034,
-                0.075,
-            );
-        }
-        push_panel_glass(
-            &mut scene.quads,
-            &panel,
-            [0.0, 0.0, 0.0],
-            [pw, ph],
-            0.032,
-            if self.embedded_panel {
-                qk_rgba(236, 244, 252, 0.84)
-            } else {
-                col_glass_window()
-            },
-            col_rim_luminous(),
-        );
-
-        let Some(sel_idx) = self.primary_selected.filter(|&i| i < self.all_entries.len()) else {
-            return;
-        };
-        let entry = &self.all_entries[sel_idx];
-
-        // Massive Edge-to-Edge Visual Canvas (`0.414m × 0.500m`)
-        let stage_y = 0.105f32;
-        let stage_w = 0.414f32;
-        let stage_h = 0.500f32;
-
-        let inspect = self
-            .previewer
-            .active_inspect
-            .as_ref()
-            .filter(|p| p.path == entry.path);
-
-        let mut compact_stat = fs_ops::format_bytes(entry.size);
-        if let Some(inspect) = inspect {
-            if !inspect.summary_note.is_empty() {
-                compact_stat = format!("{} · {}", compact_stat, inspect.summary_note);
-            }
-            if let Some(ref mesh) = inspect.mesh {
-                push_panel_glass(
-                    &mut scene.quads,
-                    &panel,
-                    [0.0, stage_y, 0.004],
-                    [stage_w, stage_h],
-                    0.024,
-                    qk_rgba(232, 243, 255, 0.78),
-                    [1.0, 1.0, 1.0, 0.65],
-                );
-                let spin = self.start_instant.elapsed().as_secs_f32() * 0.85;
-                let holo_world = vec3_add(
-                    panel.position,
-                    quat_rotate_vec3(panel.orientation, [0.0, stage_y, 0.110]),
-                );
-                let holo_rot = quat_mul(panel.orientation, quat_from_yaw_pitch(spin, 0.26));
-                push_hologram_mesh(
-                    &mut scene.solid_vertices,
-                    holo_world,
-                    holo_rot,
-                    0.255,
-                    &mesh.vertices,
-                    qk_rgba(68, 136, 252, 1.0),
-                );
-            } else if inspect.image.is_some() {
-                push_textured_quad(
-                    &mut scene.quads,
-                    &panel,
-                    [0.0, stage_y, 0.006],
-                    [stage_w, stage_h],
-                    0.024,
-                    3,
-                    0.0,
-                );
-            } else if let Some(&card_tex) = self.thumb_slot_by_path.get(&entry.path) {
-                push_textured_quad(
-                    &mut scene.quads,
-                    &panel,
-                    [0.0, stage_y, 0.006],
-                    [stage_w, stage_h],
-                    0.024,
-                    2,
-                    card_tex as f32,
-                );
-            } else {
-                push_panel_glass(
-                    &mut scene.quads,
-                    &panel,
-                    [0.0, stage_y, 0.004],
-                    [stage_w, stage_h],
-                    0.024,
-                    col_content_canvas(),
-                    [1.0, 1.0, 1.0, 0.50],
-                );
-                push_textured_quad(
-                    &mut scene.quads,
-                    &panel,
-                    [0.0, stage_y + 0.01, 0.008],
-                    [0.165, 0.165],
-                    0.008,
-                    2,
-                    icon_slot_for_kind(entry.kind) as f32,
-                );
-            }
-        }
-
-        // Single Iconic Title Row (`[Category Squircle Icon]  Name` + tiny numeric tag)
-        push_textured_quad(
-            &mut scene.quads,
-            &panel,
-            [-0.180, -0.192, 0.006],
-            [0.036, 0.036],
-            0.008,
-            2,
-            icon_slot_for_kind(entry.kind) as f32,
-        );
-        push_panel_text(
-            &mut scene.quads,
-            &panel,
-            [-0.150, -0.193, 0.006],
-            &short_display_stem(entry),
-            0.0185,
-            0.24,
-            col_ink_navy(),
-            FontWeight::Bold,
-            glyphs,
-        );
-        push_panel_text(
-            &mut scene.quads,
-            &panel,
-            [-0.150, -0.216, 0.006],
-            &compact_stat,
-            0.0125,
-            0.32,
-            col_muted_slate(),
-            FontWeight::Regular,
-            glyphs,
-        );
-
-        // 4 Pure Circular Spatial Icon Orbs (`[▶/↗]` `[✎]` `[❐]` `[🗑]`, ZERO text buttons!)
-        let is_trash = self.current_location == TRASH_URI;
-        let is_video = entry.kind == FileKind::Video;
-        let (cta_icon, cta_tip) = if is_trash {
-            (UiIcon::UndoCurved, "还原")
-        } else if is_video {
-            (UiIcon::PlaySolid, "影院播放")
-        } else {
-            (UiIcon::OpenLaunch, "打开")
-        };
-        let cta_action = if is_trash {
-            HitAction::InspectorTrashOrRestore
-        } else {
-            HitAction::InspectorOpen { cinema: is_video }
-        };
-
-        let dock_y = -0.296f32;
-        if is_trash {
-            self.emit_icon_orb(
-                scene,
-                &panel,
-                [0.0, dock_y, 0.008],
-                0.054,
-                cta_icon,
-                cta_action,
-                true,
-                true,
-                Some(cta_tip),
-                glyphs,
-            );
-        } else {
-            self.emit_icon_orb(
-                scene,
-                &panel,
-                [-0.138, dock_y, 0.008],
-                0.052,
-                cta_icon,
-                cta_action,
-                true,
-                true,
-                Some(cta_tip),
-                glyphs,
-            );
-            self.emit_icon_orb(
-                scene,
-                &panel,
-                [-0.046, dock_y, 0.008],
-                0.048,
-                UiIcon::EditRename,
-                HitAction::StartPrompt(PromptMode::Rename),
-                false,
-                true,
-                Some("重命名"),
-                glyphs,
-            );
-            self.emit_icon_orb(
-                scene,
-                &panel,
-                [0.046, dock_y, 0.008],
-                0.048,
-                UiIcon::CopyDup,
-                HitAction::ContextAction(ContextMenuOp::Copy),
-                false,
-                true,
-                Some("复制"),
-                glyphs,
-            );
-            self.emit_icon_orb(
-                scene,
-                &panel,
-                [0.138, dock_y, 0.008],
-                0.048,
-                UiIcon::Trash,
-                HitAction::InspectorTrashOrRestore,
-                false,
-                true,
-                Some("回收站"),
-                glyphs,
-            );
-        }
-    }
-
-    /// Context Menu redesigned as a sleek **4 × 2 Floating Spatial Icon Palette** (zero text wall!).
-    fn emit_context_menu(
-        &mut self,
-        scene: &mut FrameScene,
-        eye_center: [f32; 3],
-        glyphs: &mut GlyphAtlas,
-    ) {
-        let Some(menu) = self.context_menu.clone() else {
-            return;
-        };
-        let to_eye = vec3_normalize(vec3_sub(eye_center, menu.anchor_world));
-        let pos = vec3_add(menu.anchor_world, vec3_scale(to_eye, 0.09));
-        let pose = Pose3D {
-            position: pos,
-            orientation: user_facing_orientation(pos, eye_center),
-        };
-
-        let items: &[(UiIcon, &str, ContextMenuOp)] = if self.current_location == TRASH_URI {
-            &[
-                (UiIcon::UndoCurved, "还原", ContextMenuOp::TrashOrRestore),
-                (UiIcon::CloseCross, "关闭", ContextMenuOp::Close),
-            ]
-        } else {
-            &[
-                (UiIcon::OpenLaunch, "打开", ContextMenuOp::Open),
-                (UiIcon::PlaySolid, "影院", ContextMenuOp::OpenCinema),
-                (UiIcon::NewFolder, "新建", ContextMenuOp::NewFolder),
-                (UiIcon::CopyDup, "复制", ContextMenuOp::Copy),
-                (UiIcon::CutScissors, "剪切", ContextMenuOp::Cut),
-                (UiIcon::PasteClip, "粘贴", ContextMenuOp::Paste),
-                (UiIcon::EditRename, "重命名", ContextMenuOp::Rename),
-                (UiIcon::Trash, "回收站", ContextMenuOp::TrashOrRestore),
-            ]
-        };
-
-        let cols = items.len().min(4);
-        let rows = (items.len() + 3) / 4;
-        let pw = 0.036 + (cols as f32) * 0.056;
-        let ph = 0.036 + (rows as f32) * 0.056;
-
-        push_panel_shadow(
-            &mut scene.quads,
-            &pose,
-            [0.0, -0.008, -0.008],
-            [pw, ph],
-            0.026,
-            0.024,
-            0.10,
-        );
-        push_panel_glass(
-            &mut scene.quads,
-            &pose,
-            [0.0, 0.0, 0.0],
-            [pw, ph],
-            0.026,
-            qk_rgba(244, 248, 254, 0.92),
-            col_rim_luminous(),
-        );
-
-        for (i, (icon, tip, op)) in items.iter().enumerate() {
-            let c = i % 4;
-            let r = i / 4;
-            let lx = (c as f32 - (cols as f32 - 1.0) * 0.5) * 0.056;
-            let ly = ((rows as f32 - 1.0) * 0.5 - r as f32) * 0.056;
-            self.emit_icon_orb(
-                scene,
-                &pose,
-                [lx, ly, 0.006],
-                0.044,
-                *icon,
-                HitAction::ContextAction(*op),
-                i == 0,
-                true,
-                Some(tip),
-                glyphs,
-            );
-        }
-    }
-
-    /// Left Dock Icon Slot: renders ONLY a crisp SDF vector icon (`#3790FA` Kylin-Blue orb when active);
-    /// pops out a floating frosted tooltip pill ONLY when pointed at!
-    #[allow(clippy::too_many_arguments)]
-    fn emit_sidebar_icon_dock_slot(
+    fn emit_orb(
         &mut self,
         scene: &mut FrameScene,
         panel: &Pose3D,
-        local_offset: [f32; 3],
+        at: [f32; 3],
+        diameter: f32,
         icon: UiIcon,
-        tooltip: &str,
         action: HitAction,
         active: bool,
-        glyphs: &mut GlyphAtlas,
-    ) {
-        let world_center = vec3_add(
-            panel.position,
-            quat_rotate_vec3(panel.orientation, local_offset),
+    ) -> usize {
+        let index = self.register_hit(
+            local_world(panel, at),
+            [diameter * 0.5, diameter * 0.5, 0.022],
+            action,
         );
-        let hit_idx = self.register_hit(world_center, [0.026, 0.026, 0.02], action);
-        let hovered = self.is_hit_hovered(hit_idx);
-        let z = local_offset[2] + if hovered { 0.006 } else { 0.0 };
-
-        if active || hovered {
+        let hover = self.is_hit_hovered(index);
+        let mut position = at;
+        if index != usize::MAX {
+            self.control_lifts
+                .resize(self.control_lifts.len().max(index + 1), 0.0);
+            position[2] += self.control_lifts[index];
+        }
+        if hover {
             push_panel_glass(
                 &mut scene.quads,
                 panel,
-                [local_offset[0], local_offset[1], z],
-                [0.046, 0.046],
-                0.023,
-                if active {
-                    col_kylin_blue()
-                } else {
-                    col_ghost_hover()
-                },
-                [1.0, 1.0, 1.0, if active { 0.45 } else { 0.65 }],
+                [position[0], position[1], position[2] - 0.003],
+                [diameter + 0.014; 2],
+                (diameter + 0.014) * 0.5,
+                qk_rgba(55, 144, 250, 0.10),
+                qk_rgba(
+                    55,
+                    144,
+                    250,
+                    0.46 + 0.12 * (self.start_instant.elapsed().as_secs_f32() * 3.0).sin(),
+                ),
             );
         }
-
+        push_panel_glass(
+            &mut scene.quads,
+            panel,
+            position,
+            [diameter; 2],
+            diameter * 0.5,
+            if active {
+                col_kylin_blue()
+            } else if hover {
+                col_card_hover()
+            } else {
+                col_orb_idle()
+            },
+            col_rim_luminous(),
+        );
+        position[2] += 0.005;
         push_ui_icon(
             &mut scene.quads,
             panel,
-            [local_offset[0], local_offset[1], z + 0.004],
-            0.024,
+            position,
+            diameter * 0.50,
             icon,
             if active {
                 col_pure_white()
@@ -2728,112 +1718,483 @@ impl SpatialFilesApp {
                 col_ink_navy()
             },
         );
+        index
+    }
 
-        if hovered {
-            let tw = (0.036 + tooltip.chars().count() as f32 * 0.017).clamp(0.072, 0.16);
-            let tx = local_offset[0] + 0.036 + tw * 0.5;
-            push_panel_glass(
+    fn emit_ornaments(&mut self, scene: &mut FrameScene, panel: &Pose3D, glyphs: &mut GlyphAtlas) {
+        push_panel_glass(
+            &mut scene.quads,
+            panel,
+            [-0.68, 0.02, 0.026],
+            [0.104, 0.52],
+            0.052,
+            qk_rgba(239, 247, 255, 0.65),
+            qk_rgba(255, 255, 255, 0.35),
+        );
+        let nav: Vec<_> = ["HOME", "DOCS", "PICS", "VIDS", "DOWN", "TRSH"]
+            .iter()
+            .filter_map(|tag| self.bookmarks.iter().find(|b| b.icon_tag == *tag).cloned())
+            .collect();
+        for (i, bookmark) in nav.iter().enumerate() {
+            let y = 0.22 - i as f32 * 0.080;
+            let index = self.emit_orb(
+                scene,
+                panel,
+                [-0.68, y, 0.032],
+                0.072,
+                UiIcon::from_bookmark_tag(&bookmark.icon_tag),
+                HitAction::NavigateLocation(bookmark.target.clone()),
+                self.current_location == bookmark.target,
+            );
+            if self.is_hit_hovered(index) {
+                push_panel_glass(
+                    &mut scene.quads,
+                    panel,
+                    [-0.50, y, 0.075],
+                    [0.23, 0.055],
+                    0.0275,
+                    col_card_hover(),
+                    col_rim_luminous(),
+                );
+                push_panel_text_centered(
+                    &mut scene.quads,
+                    panel,
+                    [-0.50, y - 0.009, 0.079],
+                    &bookmark.label,
+                    0.026,
+                    0.21,
+                    col_ink_navy(),
+                    FontWeight::Bold,
+                    glyphs,
+                );
+            }
+        }
+        self.emit_orb(
+            scene,
+            panel,
+            [-0.55, 0.345, 0.024],
+            0.068,
+            UiIcon::BackLeft,
+            HitAction::NavigateBack,
+            false,
+        );
+        let editing = self.prompt_mode.is_some();
+        let width = self.path_pill_width;
+        push_panel_glass(
+            &mut scene.quads,
+            panel,
+            [0.005, 0.345, 0.024],
+            [width, 0.068],
+            0.034,
+            col_card_surface(),
+            qk_rgba(255, 255, 255, 0.50),
+        );
+        if editing {
+            push_panel_text(
                 &mut scene.quads,
                 panel,
-                [tx, local_offset[1], z + 0.018],
-                [tw, 0.030],
-                0.015,
-                qk_rgba(250, 252, 255, 0.94),
-                col_rim_luminous(),
+                [-0.30, 0.333, 0.030],
+                &format!("{}│", self.prompt_buffer),
+                0.036,
+                0.43,
+                col_ink_navy(),
+                FontWeight::Bold,
+                glyphs,
+            );
+            for (x, icon, action) in [
+                (0.19, UiIcon::BackLeft, HitAction::PromptBackspace),
+                (0.275, UiIcon::CheckMark, HitAction::PromptCommit),
+                (0.36, UiIcon::CloseCross, HitAction::PromptCancel),
+            ] {
+                self.emit_orb(scene, panel, [x, 0.345, 0.036], 0.068, icon, action, false);
+            }
+        } else {
+            let title = if self.current_location == TRASH_URI {
+                "回收站".into()
+            } else {
+                Path::new(&self.current_location)
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "文件".into())
+            };
+            push_textured_quad(
+                &mut scene.quads,
+                panel,
+                [-0.30, 0.345, 0.032],
+                [0.043, 0.043],
+                0.008,
+                2,
+                0.0,
             );
             push_panel_text(
                 &mut scene.quads,
                 panel,
-                [tx - tw * 0.5 + 0.014, local_offset[1] - 0.0062, z + 0.022],
-                tooltip,
-                0.014,
-                tw - 0.02,
+                [-0.263, 0.333, 0.032],
+                &title,
+                0.038,
+                0.49,
+                col_ink_navy(),
+                FontWeight::Bold,
+                glyphs,
+            );
+            self.emit_orb(
+                scene,
+                panel,
+                [0.31, 0.345, 0.034],
+                0.068,
+                UiIcon::Search,
+                HitAction::StartPrompt(PromptMode::Search),
+                false,
+            );
+            let (icon, next) = match self.view_mode {
+                ViewMode::Workbench => (UiIcon::Cube3DView, ViewMode::Treemap3D),
+                ViewMode::Treemap3D => (UiIcon::GridView, ViewMode::Workbench),
+            };
+            self.emit_orb(
+                scene,
+                panel,
+                [0.46, 0.345, 0.024],
+                0.068,
+                icon,
+                HitAction::ToggleView(next),
+                false,
+            );
+            if !self.undo_stack.is_empty() {
+                self.emit_orb(
+                    scene,
+                    panel,
+                    [0.55, 0.345, 0.024],
+                    0.068,
+                    UiIcon::UndoCurved,
+                    HitAction::UndoLast,
+                    false,
+                );
+            }
+        }
+        let pages = self.page_count();
+        push_panel_glass(
+            &mut scene.quads,
+            panel,
+            [0.02, -0.355, 0.022],
+            [0.28, 0.068],
+            0.034,
+            qk_rgba(245, 250, 255, 0.45),
+            qk_rgba(255, 255, 255, 0.30),
+        );
+        self.register_hit(
+            local_world(panel, [-0.05, -0.355, 0.025]),
+            [0.07, 0.034, 0.015],
+            HitAction::PageDelta(-1),
+        );
+        self.register_hit(
+            local_world(panel, [0.09, -0.355, 0.025]),
+            [0.07, 0.034, 0.015],
+            HitAction::PageDelta(1),
+        );
+        let visible = pages.min(9);
+        let first = self
+            .page
+            .saturating_sub(4)
+            .min(pages.saturating_sub(visible));
+        for i in 0..visible {
+            let current = first + i == self.page;
+            let x = 0.02 + (i as f32 - (visible - 1) as f32 * 0.5) * 0.024;
+            push_panel_glass(
+                &mut scene.quads,
+                panel,
+                [x, -0.355, 0.030],
+                [if current { 0.036 } else { 0.012 }, 0.012],
+                0.006,
+                if current {
+                    col_kylin_blue()
+                } else {
+                    qk_rgba(95, 120, 150, 0.38)
+                },
+                [0.0; 4],
+            );
+        }
+    }
+
+    fn emit_spatial_shelf(
+        &mut self,
+        scene: &mut FrameScene,
+        panel: &Pose3D,
+        glyphs: &mut GlyphAtlas,
+    ) {
+        let indices: Vec<_> = self
+            .filtered_indices
+            .iter()
+            .skip(self.page * CARDS_PER_PAGE)
+            .take(CARDS_PER_PAGE)
+            .copied()
+            .collect();
+        if indices.is_empty() {
+            push_panel_text_centered(
+                &mut scene.quads,
+                panel,
+                [0.0, 0.0, 0.006],
+                if self.search_query.is_empty() {
+                    "此文件夹为空"
+                } else {
+                    "没有匹配的文件"
+                },
+                0.033,
+                0.8,
                 col_ink_navy(),
                 FontWeight::Bold,
                 glyphs,
             );
         }
-    }
-
-    /// Circular Spatial Icon Orb (`diameter_m`):
-    /// - Zero permanent text!
-    /// - Optional `show_orb_idle` frosted glass circle (like UKUI `control-library.png` 04)
-    /// - Optional floating hover tooltip pill right above the orb when pointed at!
-    #[allow(clippy::too_many_arguments)]
-    fn emit_icon_orb(
-        &mut self,
-        scene: &mut FrameScene,
-        panel: &Pose3D,
-        local_offset: [f32; 3],
-        diameter_m: f32,
-        icon: UiIcon,
-        action: HitAction,
-        active_primary: bool,
-        show_orb_idle: bool,
-        hover_tooltip: Option<&str>,
-        glyphs: &mut GlyphAtlas,
-    ) {
-        let world_center = vec3_add(
-            panel.position,
-            quat_rotate_vec3(panel.orientation, local_offset),
-        );
-        let r = diameter_m * 0.5;
-        let hit_idx = self.register_hit(world_center, [r.max(0.020), r.max(0.020), 0.022], action);
-        let hovered = self.is_hit_hovered(hit_idx);
-        let z = local_offset[2] + if hovered { 0.006 } else { 0.0 };
-
-        if active_primary || hovered || show_orb_idle {
-            let fill = if active_primary {
-                col_kylin_blue()
-            } else if hovered {
-                col_card_hover()
-            } else {
-                col_orb_idle()
-            };
-            push_panel_glass(
-                &mut scene.quads,
-                panel,
-                [local_offset[0], local_offset[1], z],
-                [diameter_m, diameter_m],
-                r,
-                fill,
-                [1.0, 1.0, 1.0, if active_primary { 0.45 } else { 0.65 }],
+        for (slot, idx) in indices.into_iter().enumerate() {
+            let entry = self.all_entries[idx].clone();
+            let x = (slot % GRID_COLS) as f32 * 0.396 - 0.396;
+            let y = 0.15 - (slot / GRID_COLS) as f32 * 0.301;
+            let lift = self.slot_z_cur[slot];
+            let hit = self.register_hit(
+                local_world(panel, [x, y, lift]),
+                [0.180, 0.1325, 0.022],
+                HitAction::SelectEntry(idx),
             );
-        }
-
-        push_ui_icon(
-            &mut scene.quads,
-            panel,
-            [local_offset[0], local_offset[1], z + 0.004],
-            diameter_m * 0.52,
-            icon,
-            if active_primary {
-                col_pure_white()
+            let hover = self.is_hit_hovered(hit);
+            let selected = self.selected_entry_indices.contains(&idx);
+            self.slot_z_tgt[slot] = if hover {
+                0.028
+            } else if selected {
+                0.010
             } else {
-                col_ink_navy()
-            },
-        );
-
-        if hovered {
-            if let Some(tip) = hover_tooltip {
-                let tw = (0.034 + tip.chars().count() as f32 * 0.0165).clamp(0.068, 0.16);
-                let ty = local_offset[1] + r + 0.022;
+                0.0
+            };
+            if hover {
+                let pulse = 0.46 + 0.12 * (self.start_instant.elapsed().as_secs_f32() * 3.0).sin();
                 push_panel_glass(
                     &mut scene.quads,
                     panel,
-                    [local_offset[0], ty, z + 0.016],
-                    [tw, 0.028],
-                    0.014,
-                    qk_rgba(250, 252, 255, 0.94),
-                    col_rim_luminous(),
+                    [x, y, lift - 0.004],
+                    [0.374, 0.279],
+                    0.031,
+                    qk_rgba(55, 144, 250, 0.07),
+                    qk_rgba(55, 144, 250, pulse),
                 );
-                push_panel_text(
+            }
+            push_panel_glass(
+                &mut scene.quads,
+                panel,
+                [x, y, lift],
+                [0.360, 0.265],
+                0.026,
+                if selected {
+                    col_card_selected()
+                } else {
+                    col_card_surface()
+                },
+                if hover {
+                    col_kylin_blue()
+                } else {
+                    qk_rgba(255, 255, 255, 0.40)
+                },
+            );
+            if entry.kind == FileKind::Directory {
+                push_textured_quad(
                     &mut scene.quads,
                     panel,
-                    [local_offset[0] - tw * 0.5 + 0.013, ty - 0.006, z + 0.020],
-                    tip,
-                    0.0135,
-                    tw - 0.02,
+                    [x, y + 0.018, lift + 0.009],
+                    [0.156, 0.156],
+                    0.012,
+                    2,
+                    0.0,
+                );
+                if hover {
+                    self.previewer.request_directory_peek(&entry.path);
+                    let children = self
+                        .previewer
+                        .dir_peek_cache
+                        .get(&entry.path)
+                        .cloned()
+                        .unwrap_or_default();
+                    for (i, (path, kind)) in children.iter().enumerate() {
+                        let fan = Pose3D {
+                            position: local_world(
+                                panel,
+                                [
+                                    x + (i as f32 - 1.0) * 0.052,
+                                    y + 0.070,
+                                    lift + 0.018 + i as f32 * 0.008,
+                                ],
+                            ),
+                            orientation: quat_mul(
+                                panel.orientation,
+                                quat_from_yaw_pitch((i as f32 - 1.0) * 0.16, 0.0),
+                            ),
+                        };
+                        push_panel_glass(
+                            &mut scene.quads,
+                            &fan,
+                            [0.0; 3],
+                            [0.096, 0.076],
+                            0.012,
+                            col_card_hover(),
+                            col_rim_luminous(),
+                        );
+                        let texture = self
+                            .thumb_slot_by_path
+                            .get(path)
+                            .copied()
+                            .unwrap_or_else(|| icon_slot_for_kind(*kind));
+                        push_textured_quad(
+                            &mut scene.quads,
+                            &fan,
+                            [0.0, 0.0, 0.003],
+                            [0.092, 0.072],
+                            0.010,
+                            2,
+                            texture as f32,
+                        );
+                    }
+                }
+            } else {
+                let texture = self
+                    .thumb_slot_by_path
+                    .get(&entry.path)
+                    .copied()
+                    .unwrap_or_else(|| icon_slot_for_kind(entry.kind));
+                push_textured_quad(
+                    &mut scene.quads,
+                    panel,
+                    [x, y + 0.034, lift + 0.006],
+                    [0.352, 0.196],
+                    0.026,
+                    2,
+                    texture as f32,
+                );
+                push_panel_glass(
+                    &mut scene.quads,
+                    panel,
+                    [x, y - 0.099, lift + 0.008],
+                    [0.354, 0.063],
+                    0.020,
+                    qk_rgba(255, 255, 255, 0.94),
+                    [0.0; 4],
+                );
+            }
+            push_panel_text_centered(
+                &mut scene.quads,
+                panel,
+                [x, y - 0.111, lift + 0.012],
+                &short_display_stem(&entry),
+                CARD_TITLE_M,
+                0.316,
+                col_ink_navy(),
+                FontWeight::Bold,
+                glyphs,
+            );
+            push_ui_icon(
+                &mut scene.quads,
+                panel,
+                [x - 0.144, y + 0.095, lift + 0.013],
+                0.040,
+                UiIcon::badge_for_kind(entry.kind),
+                col_ink_navy(),
+            );
+            self.emit_orb(
+                scene,
+                panel,
+                [x + 0.137, y + 0.091, lift + 0.025],
+                0.068,
+                if entry.kind == FileKind::Directory {
+                    UiIcon::OpenLaunch
+                } else {
+                    UiIcon::Cube3DView
+                },
+                HitAction::QuickLookEntry(idx),
+                false,
+            );
+        }
+    }
+
+    fn emit_spatial_treemap(
+        &mut self,
+        scene: &mut FrameScene,
+        panel: &Pose3D,
+        eye: [f32; 3],
+        glyphs: &mut GlyphAtlas,
+    ) {
+        if self.treemap_dirty {
+            let selected: Vec<_> = self
+                .filtered_indices
+                .iter()
+                .skip(self.page * CARDS_PER_PAGE)
+                .take(CARDS_PER_PAGE)
+                .copied()
+                .collect();
+            let entries: Vec<_> = selected
+                .iter()
+                .map(|i| self.all_entries[*i].clone())
+                .collect();
+            let mut blocks = treemap3d::build_spatial_treemap(&entries, 1.05, 0.50, CARDS_PER_PAGE);
+            for block in &mut blocks {
+                block.entry_index = selected[block.entry_index];
+            }
+            self.cached_treemap = blocks;
+            self.treemap_dirty = false;
+        }
+        let podium = Pose3D {
+            position: local_world(panel, [0.0, -0.10, 0.16]),
+            orientation: quat_mul(
+                panel.orientation,
+                quat_from_yaw_pitch(0.0, 28.0f32.to_radians()),
+            ),
+        };
+        push_oriented_box(
+            &mut scene.solid_vertices,
+            &podium,
+            [0.0, -0.012, 0.0],
+            [0.56, 0.010, 0.27],
+            qk_rgba(235, 243, 252, 1.0),
+            0.04,
+        );
+        for block in self.cached_treemap.clone() {
+            let local = [block.x_center, block.height * 0.41, block.z_center];
+            let center = local_world(&podium, local);
+            let index = self.register_hit(
+                center,
+                [
+                    (block.width * 0.5).max(0.034),
+                    (block.height * 0.41).max(0.034),
+                    (block.depth * 0.5).max(0.034),
+                ],
+                HitAction::SelectEntry(block.entry_index),
+            );
+            let hover = self.is_hit_hovered(index);
+            push_oriented_box(
+                &mut scene.solid_vertices,
+                &podium,
+                local,
+                [block.width * 0.5, block.height * 0.41, block.depth * 0.5],
+                self.all_entries[block.entry_index].kind.accent_rgba(),
+                if hover { 0.32 } else { 0.05 },
+            );
+            if hover || self.primary_selected == Some(block.entry_index) {
+                let position = vec3_add(center, [0.0, block.height * 0.41 + 0.07, 0.03]);
+                let label = Pose3D {
+                    position,
+                    orientation: user_facing_orientation(position, eye),
+                };
+                push_panel_glass(
+                    &mut scene.quads,
+                    &label,
+                    [0.0; 3],
+                    [0.40, 0.068],
+                    0.034,
+                    col_card_hover(),
+                    col_rim_luminous(),
+                );
+                push_panel_text_centered(
+                    &mut scene.quads,
+                    &label,
+                    [0.0, -0.011, 0.006],
+                    &short_display_stem(&self.all_entries[block.entry_index]),
+                    0.033,
+                    0.37,
                     col_ink_navy(),
                     FontWeight::Bold,
                     glyphs,
@@ -2842,93 +2203,447 @@ impl SpatialFilesApp {
         }
     }
 
+    fn emit_pocket(&mut self, scene: &mut FrameScene, panel: &Pose3D, glyphs: &mut GlyphAtlas) {
+        let active = !self.drop_pocket.is_empty()
+            || self.drag_session.as_ref().is_some_and(|d| d.active_drag);
+        let scale = if active { 1.10 } else { 1.0 };
+        self.register_hit(
+            local_world(panel, [-0.68, -0.31, 0.030]),
+            [0.075 * scale, 0.060 * scale, 0.024],
+            HitAction::GrabPocket,
+        );
+        push_panel_glass(
+            &mut scene.quads,
+            panel,
+            [-0.68, -0.31, 0.030],
+            [0.15 * scale, 0.12 * scale],
+            0.028,
+            if active {
+                col_card_selected()
+            } else {
+                col_orb_idle()
+            },
+            if active {
+                col_kylin_blue()
+            } else {
+                col_rim_luminous()
+            },
+        );
+        for i in 0..self.drop_pocket.len().min(3) {
+            push_panel_glass(
+                &mut scene.quads,
+                panel,
+                [
+                    -0.706 + i as f32 * 0.012,
+                    -0.293 + i as f32 * 0.007,
+                    0.037 + i as f32 * 0.004,
+                ],
+                [0.045, 0.035],
+                0.007,
+                col_pure_white(),
+                col_kylin_blue(),
+            );
+        }
+        push_panel_text_centered(
+            &mut scene.quads,
+            panel,
+            [-0.68, -0.346, 0.048],
+            "暂存囊",
+            0.025,
+            0.14,
+            col_ink_navy(),
+            FontWeight::Bold,
+            glyphs,
+        );
+        if !self.drop_pocket.is_empty() {
+            push_panel_glass(
+                &mut scene.quads,
+                panel,
+                [-0.72, -0.268, 0.060],
+                [0.055, 0.042],
+                0.021,
+                col_kylin_blue(),
+                col_pure_white(),
+            );
+            push_panel_text_centered(
+                &mut scene.quads,
+                panel,
+                [-0.72, -0.276, 0.065],
+                &self.drop_pocket.len().to_string(),
+                0.025,
+                0.05,
+                col_pure_white(),
+                FontWeight::Bold,
+                glyphs,
+            );
+            self.emit_orb(
+                scene,
+                panel,
+                [-0.597, -0.273, 0.060],
+                0.068,
+                UiIcon::CloseCross,
+                HitAction::ClearPocket,
+                false,
+            );
+            self.emit_orb(
+                scene,
+                panel,
+                [-0.597, -0.351, 0.060],
+                0.068,
+                UiIcon::PasteClip,
+                HitAction::DeployPocket,
+                true,
+            );
+        }
+    }
+
+    fn emit_radial_menu(&mut self, scene: &mut FrameScene, glyphs: &mut GlyphAtlas) {
+        let menu = self.radial_menu.as_ref().unwrap();
+        let pose = Pose3D {
+            position: menu.anchor_world,
+            orientation: menu.orientation,
+        };
+        let active = menu.active_sector;
+        let on_entry = menu.on_entry;
+        let hidden = menu.sort_hidden;
+        self.register_hit(
+            local_world(&pose, [0.0, 0.0, -0.025]),
+            [0.28, 0.26, 0.010],
+            HitAction::DismissRadial,
+        );
+        push_panel_glass(
+            &mut scene.quads,
+            &pose,
+            [0.0, 0.0, -0.015],
+            [0.32; 2],
+            0.16,
+            qk_rgba(236, 245, 255, 0.74),
+            col_rim_luminous(),
+        );
+        let icons = [
+            UiIcon::OpenLaunch,
+            UiIcon::Cube3DView,
+            UiIcon::PasteClip,
+            UiIcon::Trash,
+            UiIcon::Sort,
+            if on_entry {
+                UiIcon::EditRename
+            } else {
+                UiIcon::NewFolder
+            },
+        ];
+        for (sector, icon) in icons.into_iter().enumerate() {
+            if !self.radial_sector_enabled(sector) {
+                continue;
+            }
+            let theta = std::f32::consts::FRAC_PI_2 - sector as f32 * std::f32::consts::PI / 3.0;
+            let selected = active == Some(sector);
+            self.emit_orb(
+                scene,
+                &pose,
+                [theta.cos() * 0.115, theta.sin() * 0.115, 0.012],
+                0.076 * if selected { 1.22 } else { 1.0 },
+                icon,
+                HitAction::RadialSector(sector),
+                selected,
+            );
+        }
+        let label = active
+            .filter(|sector| self.radial_sector_enabled(*sector))
+            .map(|sector| match sector {
+                0 => "打开 / 播放",
+                1 => "Quick Look",
+                2 if on_entry => "放入暂存囊",
+                2 => "投放到此",
+                3 if self.current_location == TRASH_URI => "还原",
+                3 => "移入回收站",
+                4 if hidden && self.show_hidden => "隐藏项目",
+                4 if hidden => "显示隐藏项",
+                4 => "排序 · 长按显隐",
+                5 if on_entry => "重命名",
+                _ => "新建文件夹",
+            })
+            .unwrap_or("取消");
+        push_panel_text_centered(
+            &mut scene.quads,
+            &pose,
+            [0.0, -0.009, 0.068],
+            label,
+            0.029,
+            0.27,
+            col_ink_navy(),
+            FontWeight::Bold,
+            glyphs,
+        );
+    }
+
+    fn emit_quick_look(&mut self, scene: &mut FrameScene, stage: &Pose3D, glyphs: &mut GlyphAtlas) {
+        let Some(index) = self
+            .primary_selected
+            .filter(|i| *i < self.all_entries.len())
+        else {
+            self.quick_look_open = false;
+            return;
+        };
+        let entry = self.all_entries[index].clone();
+        self.register_hit(
+            local_world(stage, [0.0, 0.0, 0.035]),
+            [0.78, 0.43, 0.008],
+            HitAction::QuickLookClose,
+        );
+        push_panel_glass(
+            &mut scene.quads,
+            stage,
+            [0.0, 0.0, 0.035],
+            [1.56, 0.86],
+            0.080,
+            qk_rgba(20, 31, 47, 0.18),
+            [0.0; 4],
+        );
+        let panel = Pose3D {
+            position: local_world(stage, [0.0, 0.0, 0.11]),
+            orientation: stage.orientation,
+        };
+        push_panel_glass(
+            &mut scene.quads,
+            &panel,
+            [0.0; 3],
+            [0.88, 0.60],
+            0.040,
+            qk_rgba(240, 247, 255, 0.94),
+            col_rim_luminous(),
+        );
+        self.register_hit(
+            local_world(&panel, [0.0, 0.020, 0.015]),
+            [0.415, 0.20, 0.022],
+            HitAction::OrbitModel,
+        );
+        push_panel_text_centered(
+            &mut scene.quads,
+            &panel,
+            [0.0, 0.250, 0.012],
+            &short_display_stem(&entry),
+            0.036,
+            0.77,
+            col_ink_navy(),
+            FontWeight::Bold,
+            glyphs,
+        );
+        let inspect = self
+            .previewer
+            .active_inspect
+            .as_ref()
+            .filter(|p| p.path == entry.path);
+        if let Some(inspect) = inspect {
+            if let Some(mesh) = &inspect.mesh {
+                let auto = if self.holo_user_rotated {
+                    0.0
+                } else {
+                    self.start_instant.elapsed().as_secs_f32() * 0.35
+                };
+                push_hologram_mesh(
+                    &mut scene.solid_vertices,
+                    local_world(&panel, [0.0, 0.030, 0.22]),
+                    quat_mul(
+                        panel.orientation,
+                        quat_from_yaw_pitch(
+                            auto + self.holo_yaw_pitch[0],
+                            0.22 + self.holo_yaw_pitch[1],
+                        ),
+                    ),
+                    0.34,
+                    &mesh.vertices,
+                    qk_rgba(68, 136, 252, 1.0),
+                );
+            } else if matches!(entry.kind, FileKind::Image | FileKind::Video)
+                && inspect.image.is_some()
+            {
+                push_textured_quad(
+                    &mut scene.quads,
+                    &panel,
+                    [0.0, 0.018, 0.018],
+                    [0.82, 0.405],
+                    0.026,
+                    3,
+                    0.0,
+                );
+            } else {
+                for (row, text) in inspect.text_lines.iter().take(10).enumerate() {
+                    push_panel_text(
+                        &mut scene.quads,
+                        &panel,
+                        [-0.386, 0.180 - row as f32 * 0.033, 0.022],
+                        text,
+                        0.025,
+                        0.77,
+                        col_ink_navy(),
+                        FontWeight::Regular,
+                        glyphs,
+                    );
+                }
+                push_panel_glass(
+                    &mut scene.quads,
+                    &panel,
+                    [0.0, -0.174, 0.026],
+                    [0.79, 0.045],
+                    0.0225,
+                    col_card_selected(),
+                    [0.0; 4],
+                );
+                push_panel_text_centered(
+                    &mut scene.quads,
+                    &panel,
+                    [0.0, -0.182, 0.032],
+                    &inspect.summary_note,
+                    0.025,
+                    0.75,
+                    col_muted_slate(),
+                    FontWeight::Bold,
+                    glyphs,
+                );
+            }
+        } else {
+            push_panel_text_centered(
+                &mut scene.quads,
+                &panel,
+                [0.0, 0.0, 0.025],
+                "正在载入预览…",
+                0.033,
+                0.7,
+                col_ink_navy(),
+                FontWeight::Bold,
+                glyphs,
+            );
+        }
+        self.emit_orb(
+            scene,
+            &panel,
+            [0.438, 0.296, 0.020],
+            0.076,
+            UiIcon::CloseCross,
+            HitAction::QuickLookClose,
+            false,
+        );
+        for (x, icon, action) in [
+            (
+                -0.27,
+                if entry.kind == FileKind::Video {
+                    UiIcon::PlaySolid
+                } else {
+                    UiIcon::OpenLaunch
+                },
+                HitAction::InspectorOpen,
+            ),
+            (-0.09, UiIcon::PasteClip, HitAction::StashSelected),
+            (
+                0.09,
+                UiIcon::EditRename,
+                HitAction::StartPrompt(PromptMode::Rename),
+            ),
+            (
+                0.27,
+                if self.current_location == TRASH_URI {
+                    UiIcon::UndoCurved
+                } else {
+                    UiIcon::Trash
+                },
+                HitAction::InspectorTrashOrRestore,
+            ),
+        ] {
+            if self.current_location == TRASH_URI
+                && matches!(
+                    action,
+                    HitAction::StashSelected | HitAction::StartPrompt(_) | HitAction::InspectorOpen
+                )
+            {
+                continue;
+            }
+            self.emit_orb(
+                scene,
+                &panel,
+                [x, -0.245, 0.020],
+                0.076,
+                icon,
+                action,
+                false,
+            );
+        }
+    }
+
     fn update_hover_and_emit_hands(
         &mut self,
         scene: &mut FrameScene,
-        eye_center: [f32; 3],
+        eye: [f32; 3],
         hands: &[HandControllerInput; 2],
         glyphs: &mut GlyphAtlas,
     ) {
-        for h in 0..2 {
-            let ctrl = hands[h];
+        for (hand, ctrl) in hands.iter().enumerate() {
             if !ctrl.active {
-                self.hovered_hit[h] = None;
+                self.hovered_hit[hand] = None;
                 continue;
             }
-            let pick = self.hit_batch.pick_ray(ctrl.aim_origin, ctrl.aim_dir, 0.06, 8.0);
-            let new_hover = pick.map(|p| p.index);
-            if new_hover.is_some() && new_hover != self.hovered_hit[h] {
-                if self.pending_haptics[h].is_none() {
-                    self.pending_haptics[h] = Some(HapticEvent::HoverTick);
-                }
+            let pick = self
+                .hit_batch
+                .pick_ray(ctrl.aim_origin, ctrl.aim_dir, 0.06, 8.0);
+            let hover = pick.map(|p| p.index);
+            if hover.is_some() && hover != self.hovered_hit[hand] {
+                self.pending_haptics[hand].get_or_insert(HapticEvent::HoverTick);
             }
-            self.hovered_hit[h] = new_hover;
-
-            let hit_dist = pick.map(|p| p.distance).unwrap_or(1.85);
-            let ray_start = vec3_add(ctrl.aim_origin, vec3_scale(ctrl.aim_dir, 0.14));
-            let ray_end = vec3_add(ctrl.aim_origin, vec3_scale(ctrl.aim_dir, hit_dist));
+            self.hovered_hit[hand] = hover;
+            let distance = pick.map(|p| p.distance).unwrap_or(1.85);
+            let end = vec3_add(ctrl.aim_origin, vec3_scale(ctrl.aim_dir, distance));
             if !self.embedded_panel {
                 push_beam_segment(
                     &mut scene.solid_vertices,
-                    ray_start,
-                    ray_end,
+                    vec3_add(ctrl.aim_origin, vec3_scale(ctrl.aim_dir, 0.14)),
+                    end,
                     0.0014,
                     0.0006,
                     qk_rgba(255, 255, 255, 0.72),
                     0.35,
                 );
             }
-
-            if let Some(p) = pick {
-                let normal = vec3_normalize(vec3_sub(eye_center, p.hit_point));
-                let reticle_pos = vec3_add(p.hit_point, vec3_scale(normal, 0.004));
-                let reticle_pose = Pose3D {
-                    position: reticle_pos,
-                    orientation: user_facing_orientation(reticle_pos, eye_center),
+            let dragging = self
+                .drag_session
+                .as_ref()
+                .is_some_and(|d| d.hand == hand && d.active_drag);
+            if pick.is_none() || dragging {
+                let reticle = Pose3D {
+                    position: end,
+                    orientation: user_facing_orientation(end, eye),
                 };
-                let r_size = if ctrl.trigger_pressed { 0.014 } else { 0.018 };
                 push_panel_glass(
                     &mut scene.quads,
-                    &reticle_pose,
-                    [0.0, 0.0, 0.0],
-                    [r_size, r_size],
-                    r_size * 0.5,
-                    col_pure_white(),
-                    col_kylin_blue(),
+                    &reticle,
+                    [0.0; 3],
+                    [0.014; 2],
+                    0.007,
+                    qk_rgba(255, 255, 255, 0.48),
+                    [0.0; 4],
                 );
             }
-
-            if let Some(ref drag) = self.drag_session {
-                if drag.hand == h && drag.active_drag {
-                    let ghost_pos = vec3_add(ray_end, [0.0, 0.045, 0.0]);
-                    let ghost_pose = Pose3D {
-                        position: ghost_pos,
-                        orientation: user_facing_orientation(ghost_pos, eye_center),
+            if let Some(drag) = &self.drag_session {
+                if drag.hand == hand && drag.active_drag {
+                    let ghost = Pose3D {
+                        position: vec3_add(end, [0.0, 0.06, 0.0]),
+                        orientation: user_facing_orientation(end, eye),
                     };
                     push_panel_glass(
                         &mut scene.quads,
-                        &ghost_pose,
-                        [0.0, 0.0, 0.02],
-                        [0.18, 0.044],
-                        0.022,
+                        &ghost,
+                        [0.0; 3],
+                        [0.22, 0.068],
+                        0.034,
                         col_kylin_blue(),
                         col_pure_white(),
                     );
-                    push_ui_icon(
+                    push_panel_text_centered(
                         &mut scene.quads,
-                        &ghost_pose,
-                        [-0.064, 0.0, 0.025],
-                        0.020,
-                        UiIcon::OpenLaunch,
-                        col_pure_white(),
-                    );
-                    push_panel_text(
-                        &mut scene.quads,
-                        &ghost_pose,
-                        [-0.044, -0.0068, 0.025],
+                        &ghost,
+                        [0.0, -0.011, 0.006],
                         &drag.primary_label,
-                        0.015,
-                        0.12,
+                        0.029,
+                        0.20,
                         col_pure_white(),
                         FontWeight::Bold,
                         glyphs,
@@ -2939,7 +2654,47 @@ impl SpatialFilesApp {
     }
 }
 
-/// Strips verbose file extensions and underscores so card labels stay short, scannable, and effortless!
+fn local_world(pose: &Pose3D, offset: [f32; 3]) -> [f32; 3] {
+    vec3_add(pose.position, quat_rotate_vec3(pose.orientation, offset))
+}
+
+fn angle_between(a: [f32; 3], b: [f32; 3]) -> f32 {
+    vec3_dot(vec3_normalize(a), vec3_normalize(b))
+        .clamp(-1.0, 1.0)
+        .acos()
+}
+
+fn ray_yaw_delta(start: [f32; 3], end: [f32; 3]) -> f32 {
+    let delta = end[0].atan2(-end[2]) - start[0].atan2(-start[2]);
+    delta.sin().atan2(delta.cos())
+}
+
+fn ray_plane_point(
+    origin: [f32; 3],
+    dir: [f32; 3],
+    point: [f32; 3],
+    normal: [f32; 3],
+) -> Option<[f32; 3]> {
+    let denominator = vec3_dot(dir, normal);
+    if denominator.abs() < 1e-6 {
+        return None;
+    }
+    let t = vec3_dot(vec3_sub(point, origin), normal) / denominator;
+    (t > 0.0 && t.is_finite()).then(|| vec3_add(origin, vec3_scale(dir, t)))
+}
+
+fn radial_sector(offset: [f32; 2]) -> Option<usize> {
+    if offset[0].hypot(offset[1]) < 0.032 {
+        return None;
+    }
+    let angle = offset[1].atan2(offset[0]);
+    Some(
+        ((std::f32::consts::FRAC_PI_2 - angle) / (std::f32::consts::PI / 3.0))
+            .round()
+            .rem_euclid(6.0) as usize,
+    )
+}
+
 fn short_display_stem(entry: &FileEntry) -> String {
     if entry.kind == FileKind::Directory {
         return entry.name.clone();
@@ -2950,34 +2705,6 @@ fn short_display_stem(entry: &FileEntry) -> String {
         .filter(|s| !s.is_empty())
         .unwrap_or(&entry.name);
     stem.replace('_', " ")
-}
-
-fn push_panel_shadow(
-    quads: &mut Vec<QuadInstance>,
-    panel: &Pose3D,
-    local_offset: [f32; 3],
-    panel_size_m: [f32; 2],
-    radius_m: f32,
-    spread_m: f32,
-    alpha: f32,
-) {
-    let total_w = panel_size_m[0] + spread_m * 2.0;
-    let total_h = panel_size_m[1] + spread_m * 2.0;
-    let center = vec3_add(
-        panel.position,
-        quat_rotate_vec3(panel.orientation, local_offset),
-    );
-    let right_vec = quat_rotate_vec3(panel.orientation, [0.5 * total_w, 0.0, 0.0]);
-    let up_vec = quat_rotate_vec3(panel.orientation, [0.0, 0.5 * total_h, 0.0]);
-    quads.push(QuadInstance {
-        center,
-        right_vec,
-        up_vec,
-        uv_rect: [0.0, 0.0, 0.002, 0.002],
-        fill_color: qk_rgba(28, 48, 84, alpha),
-        border_color: [0.0; 4],
-        params: [radius_m, spread_m, 4.0, 0.0],
-    });
 }
 
 fn push_panel_glass(
@@ -3058,6 +2785,26 @@ fn push_ui_icon(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn push_panel_text_centered(
+    quads: &mut Vec<QuadInstance>,
+    panel: &Pose3D,
+    mut origin: [f32; 3],
+    text: &str,
+    height: f32,
+    width: f32,
+    color: [f32; 4],
+    weight: FontWeight,
+    glyphs: &mut GlyphAtlas,
+) {
+    let raster = (height * 2600.0).clamp(28.0, 96.0);
+    let m_per_px = height / raster;
+    let (_, advance) = glyphs.layout_line_weighted(text, raster, width / m_per_px, weight);
+    origin[0] -= advance * m_per_px * 0.5;
+    push_panel_text(
+        quads, panel, origin, text, height, width, color, weight, glyphs,
+    );
+}
+
 fn push_panel_text(
     quads: &mut Vec<QuadInstance>,
     panel: &Pose3D,
@@ -3069,7 +2816,7 @@ fn push_panel_text(
     weight: FontWeight,
     glyphs: &mut GlyphAtlas,
 ) {
-    let raster_px = (height_m * 2400.0).clamp(24.0, 68.0);
+    let raster_px = (height_m * 2600.0).clamp(28.0, 96.0);
     let m_per_px = height_m / raster_px;
     let max_px = (max_width_m / m_per_px).max(16.0);
     let (laid_out, _) = glyphs.layout_line_weighted(text, raster_px, max_px, weight);
@@ -3115,27 +2862,57 @@ fn push_oriented_box(
     let faces: &[([f32; 3], [[f32; 3]; 4])] = &[
         (
             [0.0, 0.0, 1.0],
-            [[-1.0, -1.0, 1.0], [1.0, -1.0, 1.0], [1.0, 1.0, 1.0], [-1.0, 1.0, 1.0]],
+            [
+                [-1.0, -1.0, 1.0],
+                [1.0, -1.0, 1.0],
+                [1.0, 1.0, 1.0],
+                [-1.0, 1.0, 1.0],
+            ],
         ),
         (
             [0.0, 0.0, -1.0],
-            [[1.0, -1.0, -1.0], [-1.0, -1.0, -1.0], [-1.0, 1.0, -1.0], [1.0, 1.0, -1.0]],
+            [
+                [1.0, -1.0, -1.0],
+                [-1.0, -1.0, -1.0],
+                [-1.0, 1.0, -1.0],
+                [1.0, 1.0, -1.0],
+            ],
         ),
         (
             [0.0, 1.0, 0.0],
-            [[-1.0, 1.0, 1.0], [1.0, 1.0, 1.0], [1.0, 1.0, -1.0], [-1.0, 1.0, -1.0]],
+            [
+                [-1.0, 1.0, 1.0],
+                [1.0, 1.0, 1.0],
+                [1.0, 1.0, -1.0],
+                [-1.0, 1.0, -1.0],
+            ],
         ),
         (
             [0.0, -1.0, 0.0],
-            [[-1.0, -1.0, -1.0], [1.0, -1.0, -1.0], [1.0, -1.0, 1.0], [-1.0, -1.0, 1.0]],
+            [
+                [-1.0, -1.0, -1.0],
+                [1.0, -1.0, -1.0],
+                [1.0, -1.0, 1.0],
+                [-1.0, -1.0, 1.0],
+            ],
         ),
         (
             [1.0, 0.0, 0.0],
-            [[1.0, -1.0, 1.0], [1.0, -1.0, -1.0], [1.0, 1.0, -1.0], [1.0, 1.0, 1.0]],
+            [
+                [1.0, -1.0, 1.0],
+                [1.0, -1.0, -1.0],
+                [1.0, 1.0, -1.0],
+                [1.0, 1.0, 1.0],
+            ],
         ),
         (
             [-1.0, 0.0, 0.0],
-            [[-1.0, -1.0, -1.0], [-1.0, -1.0, 1.0], [-1.0, 1.0, 1.0], [-1.0, 1.0, -1.0]],
+            [
+                [-1.0, -1.0, -1.0],
+                [-1.0, -1.0, 1.0],
+                [-1.0, 1.0, 1.0],
+                [-1.0, 1.0, -1.0],
+            ],
         ),
     ];
 
@@ -3219,5 +2996,362 @@ fn push_hologram_mesh(
             color,
             emissive: 0.16,
         });
+    }
+}
+
+#[cfg(test)]
+mod xrui_tests {
+    use super::*;
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "xr-files-spatial-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+        fn app(&self) -> SpatialFilesApp {
+            let mut app = SpatialFilesApp::new(Some(self.0.clone()));
+            app.set_embedded_panel(true);
+            app
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    fn eyes() -> [EyeView; 2] {
+        [SpatialFilesApp::embedded_eye(1600, 900); 2]
+    }
+    fn hand(point: [f32; 3]) -> HandControllerInput {
+        let origin = [0.0, 1.6, 0.0];
+        HandControllerInput {
+            active: true,
+            aim_origin: origin,
+            aim_dir: vec3_normalize(vec3_sub(point, origin)),
+            ..Default::default()
+        }
+    }
+    fn tick(
+        app: &mut SpatialFilesApp,
+        input: HandControllerInput,
+        glyphs: &mut GlyphAtlas,
+        base: Instant,
+        ms: u64,
+    ) -> FrameScene {
+        app.step_at(
+            &eyes(),
+            &[input, HandControllerInput::default()],
+            glyphs,
+            base + Duration::from_millis(ms),
+        )
+    }
+    fn card(slot: usize) -> [f32; 3] {
+        [
+            (slot % 3) as f32 * 0.396 - 0.396,
+            1.75 - (slot / 3) as f32 * 0.301,
+            -1.24,
+        ]
+    }
+
+    #[test]
+    fn radial_marking_menu_flick_and_release_executes_target_sector() {
+        let fixture = Fixture::new();
+        fs::write(
+            fixture.0.join("model.obj"),
+            "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n",
+        )
+        .unwrap();
+        let mut app = fixture.app();
+        let mut glyphs = GlyphAtlas::new();
+        let base = Instant::now();
+        tick(
+            &mut app,
+            HandControllerInput::default(),
+            &mut glyphs,
+            base,
+            0,
+        );
+        let mut input = hand(card(0));
+        input.secondary_pressed = true;
+        tick(&mut app, input, &mut glyphs, base, 10);
+        let menu = app.radial_menu.as_ref().unwrap().clone();
+        let point = local_world(
+            &Pose3D {
+                position: menu.anchor_world,
+                orientation: menu.orientation,
+            },
+            [0.068, 0.040, 0.0],
+        );
+        input.aim_dir = vec3_normalize(vec3_sub(point, input.aim_origin));
+        tick(&mut app, input, &mut glyphs, base, 80);
+        assert_eq!(app.radial_menu.as_ref().unwrap().active_sector, Some(1));
+        input.secondary_pressed = false;
+        tick(&mut app, input, &mut glyphs, base, 120);
+        assert!(app.quick_look_open && app.radial_menu.is_none());
+        app.cancel_modals();
+        tick(
+            &mut app,
+            HandControllerInput::default(),
+            &mut glyphs,
+            base,
+            140,
+        );
+        input = hand(card(0));
+        input.secondary_pressed = true;
+        tick(&mut app, input, &mut glyphs, base, 160);
+        input.secondary_pressed = false;
+        tick(&mut app, input, &mut glyphs, base, 210);
+        assert!(app.radial_menu.as_ref().unwrap().latched_open);
+        assert!(app.undo_stack.is_empty() && fixture.0.join("model.obj").exists());
+    }
+
+    #[test]
+    fn stationary_primary_pinch_uses_the_same_radial_menu_and_cancel_is_safe() {
+        let fixture = Fixture::new();
+        fs::write(fixture.0.join("a.txt"), "hello").unwrap();
+        let mut app = fixture.app();
+        let mut glyphs = GlyphAtlas::new();
+        let base = Instant::now();
+        tick(
+            &mut app,
+            HandControllerInput::default(),
+            &mut glyphs,
+            base,
+            0,
+        );
+        let mut input = hand(card(0));
+        input.trigger_pressed = true;
+        tick(&mut app, input, &mut glyphs, base, 10);
+        tick(&mut app, input, &mut glyphs, base, 351);
+        assert_eq!(
+            app.radial_menu.as_ref().unwrap().source,
+            RadialSource::LongPress
+        );
+        input.trigger_pressed = false;
+        tick(&mut app, input, &mut glyphs, base, 380);
+        assert!(app.radial_menu.is_none() && fixture.0.join("a.txt").exists());
+    }
+
+    #[test]
+    fn magnetic_press_lock_recovers_from_trigger_pull_wrist_dip() {
+        let fixture = Fixture::new();
+        for n in 0..6 {
+            fs::write(fixture.0.join(format!("{n}.txt")), "text").unwrap();
+        }
+        let mut app = fixture.app();
+        let mut glyphs = GlyphAtlas::new();
+        let base = Instant::now();
+        tick(
+            &mut app,
+            HandControllerInput::default(),
+            &mut glyphs,
+            base,
+            0,
+        );
+        let mut input = hand([-0.396, 1.6 + 0.15 - 0.1325 + 0.008, -1.24]);
+        tick(&mut app, input, &mut glyphs, base, 10);
+        let stable = app.recent_stable_hover[0].as_ref().unwrap().clone();
+        assert_eq!(stable.action, HitAction::SelectEntry(0));
+        let mut direction = input.aim_dir;
+        direction[1] -= 1.8f32.to_radians().tan();
+        input.aim_dir = vec3_normalize(direction);
+        input.trigger_pressed = true;
+        tick(&mut app, input, &mut glyphs, base, 40);
+        assert_eq!(app.primary_selected, Some(0));
+        assert_eq!(app.press_lock_recoveries, 1);
+    }
+
+    fn drag(
+        app: &mut SpatialFilesApp,
+        from: [f32; 3],
+        to: [f32; 3],
+        glyphs: &mut GlyphAtlas,
+        base: Instant,
+        ms: u64,
+    ) {
+        tick(app, hand(from), glyphs, base, ms);
+        let mut input = hand(from);
+        input.trigger_pressed = true;
+        tick(app, input, glyphs, base, ms + 10);
+        input = hand(to);
+        input.trigger_pressed = true;
+        tick(app, input, glyphs, base, ms + 50);
+        input.trigger_pressed = false;
+        tick(app, input, glyphs, base, ms + 70);
+    }
+
+    #[test]
+    fn spatial_drop_pocket_moves_stashed_files_across_directories_with_undo() {
+        let fixture = Fixture::new();
+        let a = fixture.0.join("A");
+        let b = fixture.0.join("B");
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        fs::write(a.join("one.txt"), "one").unwrap();
+        fs::write(a.join("two.txt"), "two").unwrap();
+        let mut app = SpatialFilesApp::new(Some(a.clone()));
+        app.set_embedded_panel(true);
+        let mut glyphs = GlyphAtlas::new();
+        let base = Instant::now();
+        tick(
+            &mut app,
+            HandControllerInput::default(),
+            &mut glyphs,
+            base,
+            0,
+        );
+        let pocket = [-0.68, 1.29, -1.21];
+        drag(&mut app, card(0), pocket, &mut glyphs, base, 10);
+        drag(&mut app, card(1), pocket, &mut glyphs, base, 180);
+        assert_eq!(app.drop_pocket.len(), 2);
+        assert!(a.join("one.txt").exists() && a.join("two.txt").exists());
+        app.navigate_to(b.to_string_lossy().into_owned());
+        tick(
+            &mut app,
+            HandControllerInput::default(),
+            &mut glyphs,
+            base,
+            300,
+        );
+        drag(&mut app, pocket, [0.0, 1.6, -1.24], &mut glyphs, base, 340);
+        assert!(app.drop_pocket.is_empty());
+        assert!(!a.join("one.txt").exists() && !a.join("two.txt").exists());
+        assert!(b.join("one.txt").exists() && b.join("two.txt").exists());
+        app.undo_last().unwrap();
+        assert!(a.join("one.txt").exists() && a.join("two.txt").exists());
+        assert!(!b.join("one.txt").exists() && !b.join("two.txt").exists());
+    }
+
+    #[test]
+    fn folder_hover_requests_directory_peek_fanout() {
+        let fixture = Fixture::new();
+        let child = fixture.0.join("folder");
+        fs::create_dir_all(&child).unwrap();
+        for n in 0..4 {
+            fs::write(child.join(format!("{n}.txt")), "document preview").unwrap();
+        }
+        let mut app = fixture.app();
+        let mut glyphs = GlyphAtlas::new();
+        let base = Instant::now();
+        tick(
+            &mut app,
+            HandControllerInput::default(),
+            &mut glyphs,
+            base,
+            0,
+        );
+        tick(&mut app, hand(card(0)), &mut glyphs, base, 10);
+        let mut fan_count = 0;
+        for step in 2..300 {
+            let scene = tick(&mut app, hand(card(0)), &mut glyphs, base, step * 10);
+            fan_count = scene
+                .quads
+                .iter()
+                .filter(|q| {
+                    (vec3_len(q.right_vec) * 2.0 - 0.092).abs() < 0.0001
+                        && (vec3_len(q.up_vec) * 2.0 - 0.072).abs() < 0.0001
+                        && q.params[2] == 2.0
+                })
+                .count();
+            if fan_count == 3 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(app.previewer.dir_peek_cache.get(&child).unwrap().len(), 3);
+        assert_eq!(fan_count, 3);
+    }
+
+    #[test]
+    fn quick_look_file_start_and_wrist_orbit_keep_model_orientation() {
+        let fixture = Fixture::new();
+        let file = fixture.0.join("prism.obj");
+        fs::write(&file, "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n").unwrap();
+        let mut app = SpatialFilesApp::new(Some(file));
+        app.set_embedded_panel(true);
+        assert!(app.quick_look_open);
+        let mut glyphs = GlyphAtlas::new();
+        let base = Instant::now();
+        tick(
+            &mut app,
+            HandControllerInput::default(),
+            &mut glyphs,
+            base,
+            0,
+        );
+        let mut input = hand([0.0, 1.62, -1.10]);
+        input.trigger_pressed = true;
+        tick(&mut app, input, &mut glyphs, base, 10);
+        assert!(app.holo_orbit_drag.is_some());
+        input.aim_dir = vec3_normalize([0.25, 0.12, -1.0]);
+        tick(&mut app, input, &mut glyphs, base, 30);
+        assert!(app.holo_yaw_pitch[0].abs() > 0.5 && app.holo_yaw_pitch[1].abs() > 0.1);
+        input.trigger_pressed = false;
+        tick(&mut app, input, &mut glyphs, base, 50);
+        let orientation = app.holo_yaw_pitch;
+        tick(
+            &mut app,
+            HandControllerInput::default(),
+            &mut glyphs,
+            base,
+            80,
+        );
+        assert_eq!(app.holo_yaw_pitch, orientation);
+        app.cancel_modals();
+        assert!(!app.quick_look_open);
+    }
+
+    #[test]
+    fn shelf_metrics_pagination_and_hot_targets_meet_optical_contract() {
+        let fixture = Fixture::new();
+        for n in 0..7 {
+            fs::write(fixture.0.join(format!("{n}.txt")), "text").unwrap();
+        }
+        let mut app = fixture.app();
+        let mut glyphs = GlyphAtlas::new();
+        let base = Instant::now();
+        tick(
+            &mut app,
+            HandControllerInput::default(),
+            &mut glyphs,
+            base,
+            0,
+        );
+        assert_eq!(app.page_count(), 2);
+        assert_eq!(
+            app.hit_actions
+                .iter()
+                .filter(|a| matches!(a, HitAction::SelectEntry(_)))
+                .count(),
+            6
+        );
+        assert!(CARD_TITLE_M / 1.24 * 1000.0 >= 26.0);
+        for i in 0..app.hit_actions.len() {
+            let (min, max) = app.hit_batch.aabb_bounds(i).unwrap();
+            assert!(max[0] - min[0] >= 0.0679 && max[1] - min[1] >= 0.0679);
+        }
+        app.step_page(1);
+        assert_eq!(app.page_scroll_offset, 0.28);
+        tick(
+            &mut app,
+            HandControllerInput::default(),
+            &mut glyphs,
+            base,
+            50,
+        );
+        assert!(app.page_scroll_offset > 0.0 && app.page_scroll_offset < 0.28);
     }
 }

@@ -137,12 +137,18 @@ impl SoaAabbBatch {
         }
     }
 
-    /// Picks the best hit along `origin + dir * t` (`t in [min_t, max_t]`).
-    ///
-    /// Enforces openKylin XR `AUDIT-01` priority:
-    /// At near-equal depth (`|t_a - t_b| < 2.5e-3`), a direct geometry hit (`direct == true`)
-    /// unconditionally wins over an expanded angular-slop hit; if both are slop hits at the
-    /// same plane depth, the one with smaller metric `border_distance` wins.
+    /// Returns the unexpanded geometry bounds, excluding SIMD padding lanes.
+    pub fn aabb_bounds(&self, index: usize) -> Option<([f32; 3], [f32; 3])> {
+        (index < self.len).then(|| {
+            (
+                [self.min_x[index], self.min_y[index], self.min_z[index]],
+                [self.max_x[index], self.max_y[index], self.max_z[index]],
+            )
+        })
+    }
+
+    /// Direct geometry always beats angular slop. At equal depth, slop hits
+    /// choose the closest border; otherwise the nearest geometry wins.
     pub fn pick_ray(
         &self,
         origin: [f32; 3],
@@ -187,9 +193,7 @@ impl SoaAabbBatch {
         let inv = safe_inv_dir(unit_dir);
         let mut best: Option<RayPickHit> = None;
         for i in 0..self.len {
-            if let Some(candidate) =
-                eval_candidate(self, i, origin, unit_dir, inv, min_t, max_t)
-            {
+            if let Some(candidate) = eval_candidate(self, i, origin, unit_dir, inv, min_t, max_t) {
                 best = Some(match best {
                     None => candidate,
                     Some(cur) => choose_better_hit(cur, candidate),
@@ -256,8 +260,10 @@ impl SoaAabbBatch {
             let tmin_z = _mm256_min_ps(tz1, tz2);
             let tmax_z = _mm256_max_ps(tz1, tz2);
 
-            let t_enter = _mm256_max_ps(_mm256_max_ps(tmin_x, tmin_y), _mm256_max_ps(tmin_z, vmin_t));
-            let t_exit = _mm256_min_ps(_mm256_min_ps(tmax_x, tmax_y), _mm256_min_ps(tmax_z, vmax_t));
+            let t_enter =
+                _mm256_max_ps(_mm256_max_ps(tmin_x, tmin_y), _mm256_max_ps(tmin_z, vmin_t));
+            let t_exit =
+                _mm256_min_ps(_mm256_min_ps(tmax_x, tmax_y), _mm256_min_ps(tmax_z, vmax_t));
             let cmp = _mm256_cmp_ps(t_enter, t_exit, _CMP_LE_OQ);
             let mut mask = _mm256_movemask_ps(cmp) as u32;
 
@@ -468,16 +474,8 @@ fn eval_candidate(
     let tz1 = (bmin[2] - origin[2]) * inv[2];
     let tz2 = (bmax[2] - origin[2]) * inv[2];
 
-    let t_enter = tx1
-        .min(tx2)
-        .max(ty1.min(ty2))
-        .max(tz1.min(tz2))
-        .max(min_t);
-    let t_exit = tx1
-        .max(tx2)
-        .min(ty1.max(ty2))
-        .min(tz1.max(tz2))
-        .min(max_t);
+    let t_enter = tx1.min(tx2).max(ty1.min(ty2)).max(tz1.min(tz2)).max(min_t);
+    let t_exit = tx1.max(tx2).min(ty1.max(ty2)).min(tz1.max(tz2)).min(max_t);
     if t_enter <= t_exit {
         let hit_point = [
             origin[0] + unit_dir[0] * t_enter,
@@ -508,10 +506,9 @@ fn eval_candidate(
         center[1] - origin[1],
         center[2] - origin[2],
     ];
-    let t_proj = (to_center[0] * unit_dir[0]
-        + to_center[1] * unit_dir[1]
-        + to_center[2] * unit_dir[2])
-        .clamp(min_t, max_t);
+    let t_proj =
+        (to_center[0] * unit_dir[0] + to_center[1] * unit_dir[1] + to_center[2] * unit_dir[2])
+            .clamp(min_t, max_t);
     let p = [
         origin[0] + unit_dir[0] * t_proj,
         origin[1] + unit_dir[1] * t_proj,
@@ -552,6 +549,12 @@ fn eval_candidate(
 /// Enforces `AUDIT-01`: coplanar or near-coplanar direct geometry hits always beat slop hits.
 #[inline]
 fn choose_better_hit(a: RayPickHit, b: RayPickHit) -> RayPickHit {
+    // A nearby expanded target must never steal an actual geometry hit.
+    match (a.direct, b.direct) {
+        (true, false) => return a,
+        (false, true) => return b,
+        _ => {}
+    }
     const COPLANAR_EPS: f32 = 2.5e-3;
     if (a.distance - b.distance).abs() <= COPLANAR_EPS {
         match (a.direct, b.direct) {
@@ -936,12 +939,10 @@ unsafe fn premultiply_avx2(rgba: &mut [u8]) {
     let zero = _mm256_setzero_si256();
     let bias = _mm256_set1_epi16(128);
     let alpha_shuf = _mm256_setr_epi8(
-        6, 7, 6, 7, 6, 7, -1, -1, 14, 15, 14, 15, 14, 15, -1, -1,
-        6, 7, 6, 7, 6, 7, -1, -1, 14, 15, 14, 15, 14, 15, -1, -1,
+        6, 7, 6, 7, 6, 7, -1, -1, 14, 15, 14, 15, 14, 15, -1, -1, 6, 7, 6, 7, 6, 7, -1, -1, 14, 15,
+        14, 15, 14, 15, -1, -1,
     );
-    let alpha_keep = _mm256_setr_epi16(
-        0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255,
-    );
+    let alpha_keep = _mm256_setr_epi16(0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255);
     while i + 32 <= rgba.len() {
         let raw = _mm256_loadu_si256(rgba.as_ptr().add(i) as *const __m256i);
         let lo = _mm256_unpacklo_epi8(raw, zero);
@@ -1048,13 +1049,7 @@ pub fn downsample_rgba_2x_scalar(src: &[u8], width: u32, height: u32) -> (Vec<u8
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn downsample_2x_avx2(
-    src: &[u8],
-    src_w: usize,
-    dst_w: usize,
-    dst_h: usize,
-    dst: &mut [u8],
-) {
+unsafe fn downsample_2x_avx2(src: &[u8], src_w: usize, dst_w: usize, dst_h: usize, dst: &mut [u8]) {
     let stride = src_w * 4;
     let zero = _mm256_setzero_si256();
     let round = _mm256_set1_epi16(2);
@@ -1121,13 +1116,7 @@ unsafe fn downsample_2x_avx2(
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn downsample_2x_neon(
-    src: &[u8],
-    src_w: usize,
-    dst_w: usize,
-    dst_h: usize,
-    dst: &mut [u8],
-) {
+unsafe fn downsample_2x_neon(src: &[u8], src_w: usize, dst_w: usize, dst_h: usize, dst: &mut [u8]) {
     let stride = src_w * 4;
     for dy in 0..dst_h {
         let row0 = src.as_ptr().add(dy * 2 * stride);
@@ -1175,7 +1164,11 @@ unsafe fn downsample_2x_neon(
 }
 
 /// Generates a full RGBA8 mipmap chain (level 0 + downsampled levels down to 1x1).
-pub fn generate_mip_chain_rgba(level0: Vec<u8>, width: u32, height: u32) -> Vec<(Vec<u8>, u32, u32)> {
+pub fn generate_mip_chain_rgba(
+    level0: Vec<u8>,
+    width: u32,
+    height: u32,
+) -> Vec<(Vec<u8>, u32, u32)> {
     let mut chain = Vec::new();
     let mut cur_w = width.max(1);
     let mut cur_h = height.max(1);
@@ -1297,7 +1290,8 @@ unsafe fn count_nl_nul_avx2(data: &[u8]) -> (usize, usize) {
     while i + 32 <= data.len() {
         let chunk = _mm256_loadu_si256(data.as_ptr().add(i) as *const __m256i);
         nl += (_mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, v_nl)) as u32).count_ones() as usize;
-        nul += (_mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, v_zero)) as u32).count_ones() as usize;
+        nul +=
+            (_mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, v_zero)) as u32).count_ones() as usize;
         i += 32;
     }
     let (rem_nl, rem_nul) = count_nl_nul_scalar(&data[i..]);
@@ -1374,8 +1368,30 @@ mod tests {
     }
 
     #[test]
+    fn direct_geometry_beats_nearer_slop_and_bounds_exclude_padding() {
+        let mut batch = SoaAabbBatch::default();
+        batch.push([0.01, -0.05, -0.81], [0.06, 0.05, -0.79], 0.056);
+        batch.push([-0.05, -0.05, -1.21], [0.05, 0.05, -1.19], 0.056);
+        batch.finalize_padding();
+        assert_eq!(
+            batch.aabb_bounds(1),
+            Some(([-0.05, -0.05, -1.21], [0.05, 0.05, -1.19]))
+        );
+        assert_eq!(batch.aabb_bounds(2), None);
+        for hit in [
+            batch.pick_ray([0.; 3], [0., 0., -1.], 0.06, 8.),
+            batch.pick_ray_scalar([0.; 3], [0., 0., -1.], 0.06, 8.),
+        ] {
+            let hit = hit.unwrap();
+            assert!(hit.direct);
+            assert_eq!(hit.index, 1);
+        }
+    }
+
+    #[test]
     fn simd_case_insensitive_and_fuzzy_search_parity() {
-        let long_name = "openKylin_XR_Spatial_Architecture_Specification_2026_v3_Final_Report.markdown";
+        let long_name =
+            "openKylin_XR_Spatial_Architecture_Specification_2026_v3_Final_Report.markdown";
         for needle in [
             "openkylin",
             "specification",
@@ -1415,9 +1431,16 @@ mod tests {
             let mut expected = actual.clone();
             premultiply_rgba_in_place(&mut actual[..len]);
             premultiply_scalar(&mut expected[..len]);
-            assert_eq!(&actual[len..], &expected[len..], "guard overwritten at {len}");
+            assert_eq!(
+                &actual[len..],
+                &expected[len..],
+                "guard overwritten at {len}"
+            );
             for (a, b) in actual[..len].iter().zip(&expected[..len]) {
-                assert!(a.abs_diff(*b) <= 1, "premultiply diff at length {len}: {a} vs {b}");
+                assert!(
+                    a.abs_diff(*b) <= 1,
+                    "premultiply diff at length {len}: {a} vs {b}"
+                );
             }
         }
     }
@@ -1441,7 +1464,10 @@ mod tests {
         let (ds_simd, dw1, dh1) = downsample_rgba_2x(&img, w, h);
         let (ds_scal, dw2, dh2) = downsample_rgba_2x_scalar(&img, w, h);
         assert_eq!((dw1, dh1), (dw2, dh2));
-        assert_eq!(ds_simd, ds_scal, "SIMD 2x box filter must match scalar bit-for-bit");
+        assert_eq!(
+            ds_simd, ds_scal,
+            "SIMD 2x box filter must match scalar bit-for-bit"
+        );
 
         let mips = generate_mip_chain_rgba(img, w, h);
         assert_eq!(mips.last().map(|(_, mw, mh)| (*mw, *mh)), Some((1, 1)));

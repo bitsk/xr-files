@@ -2400,22 +2400,21 @@ impl SpatialFilesApp {
         let Some(sel_idx) = self.primary_selected.filter(|&i| i < self.all_entries.len()) else {
             return;
         };
-        let entry = self.all_entries[sel_idx].clone();
+        let entry = &self.all_entries[sel_idx];
 
         // Massive Edge-to-Edge Visual Canvas (`0.414m × 0.500m`)
         let stage_y = 0.105f32;
         let stage_w = 0.414f32;
         let stage_h = 0.500f32;
 
-        let has_inspect = self
+        let inspect = self
             .previewer
             .active_inspect
             .as_ref()
-            .is_some_and(|p| p.path == entry.path);
+            .filter(|p| p.path == entry.path);
 
         let mut compact_stat = fs_ops::format_bytes(entry.size);
-        if has_inspect {
-            let inspect = self.previewer.active_inspect.as_ref().unwrap().clone();
+        if let Some(inspect) = inspect {
             if !inspect.summary_note.is_empty() {
                 compact_stat = format!("{} · {}", compact_stat, inspect.summary_note);
             }
@@ -2499,7 +2498,7 @@ impl SpatialFilesApp {
             &mut scene.quads,
             &panel,
             [-0.150, -0.193, 0.006],
-            &short_display_stem(&entry),
+            &short_display_stem(entry),
             0.0185,
             0.24,
             col_ink_navy(),

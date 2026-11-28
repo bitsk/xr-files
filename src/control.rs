@@ -68,6 +68,7 @@ struct PendingRequest {
 pub struct ControlServer {
     socket_path: PathBuf,
     rx: Receiver<PendingRequest>,
+    pub(crate) wake: crate::wake::Wake,
 }
 
 impl Drop for ControlServer {
@@ -112,25 +113,32 @@ impl ControlServer {
         fs::set_permissions(socket_path, fs::Permissions::from_mode(0o600))?;
 
         let (tx, rx) = mpsc::channel::<PendingRequest>();
+        let wake = crate::wake::Wake::default();
+        let worker_wake = wake.clone();
         thread::Builder::new()
             .name("xr-files-ctl".into())
-            .spawn(move || accept_loop(listener, tx))?;
+            .spawn(move || accept_loop(listener, tx, worker_wake))?;
 
         Ok(Self {
             socket_path: socket_path.to_path_buf(),
             rx,
+            wake,
         })
     }
 
-    pub fn poll_and_apply(&self, app: &mut SpatialFilesApp) {
+    pub fn poll_and_apply(&self, app: &mut SpatialFilesApp) -> bool {
+        let mut changed = false;
         while let Ok(req) = self.rx.try_recv() {
+            let updates_scene = !matches!(req.command, ControlCommand::Status);
             let reply = execute_command(app, req.version, req.id, req.command);
+            changed |= updates_scene && reply.ok;
             let _ = req.reply_tx.send(reply);
         }
+        changed
     }
 }
 
-fn accept_loop(listener: UnixListener, tx: mpsc::Sender<PendingRequest>) {
+fn accept_loop(listener: UnixListener, tx: mpsc::Sender<PendingRequest>, wake: crate::wake::Wake) {
     for incoming in listener.incoming() {
         let Ok(mut stream) = incoming else { continue };
         let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
@@ -179,6 +187,7 @@ fn accept_loop(listener: UnixListener, tx: mpsc::Sender<PendingRequest>) {
                     })
                     .is_ok()
                 {
+                    wake.notify();
                     if let Ok(reply) = reply_rx.recv_timeout(Duration::from_secs(3)) {
                         let _ = write_json_line(&mut stream, &reply);
                     }
@@ -211,7 +220,10 @@ fn execute_command(
             ControlCommand::Status => {}
             ControlCommand::Open { path } => {
                 let p = PathBuf::from(&path);
-                ensure!(p.is_absolute() || path == "trash://", "open 需要绝对路径或 trash://");
+                ensure!(
+                    p.is_absolute() || path == "trash://",
+                    "open 需要绝对路径或 trash://"
+                );
                 if path == "trash://" || p.is_dir() {
                     app.navigate_to(path);
                 } else if p.exists() {

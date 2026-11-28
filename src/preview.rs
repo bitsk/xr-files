@@ -65,6 +65,7 @@ pub enum PreviewResult {
 }
 
 pub struct AsyncPreviewer {
+    pub(crate) wake: crate::wake::Wake,
     tx: Sender<PreviewJob>,
     rx: Receiver<PreviewResult>,
     pending_thumbs: HashSet<PathBuf>,
@@ -78,11 +79,14 @@ impl AsyncPreviewer {
     pub fn new() -> Self {
         let (job_tx, job_rx) = mpsc::channel::<PreviewJob>();
         let (res_tx, res_rx) = mpsc::channel::<PreviewResult>();
+        let wake = crate::wake::Wake::default();
+        let worker_wake = wake.clone();
         thread::Builder::new()
             .name("xr-files-preview".into())
-            .spawn(move || worker_loop(job_rx, res_tx))
+            .spawn(move || worker_loop(job_rx, res_tx, worker_wake))
             .expect("spawn xr-files preview worker");
         Self {
+            wake,
             tx: job_tx,
             rx: res_rx,
             pending_thumbs: HashSet::new(),
@@ -153,7 +157,7 @@ impl AsyncPreviewer {
     }
 }
 
-fn worker_loop(rx: Receiver<PreviewJob>, tx: Sender<PreviewResult>) {
+fn worker_loop(rx: Receiver<PreviewJob>, tx: Sender<PreviewResult>, wake: crate::wake::Wake) {
     while let Ok(job) = rx.recv() {
         let reply = match job {
             PreviewJob::Thumbnail { path, kind } => {
@@ -167,6 +171,7 @@ fn worker_loop(rx: Receiver<PreviewJob>, tx: Sender<PreviewResult>) {
         if tx.send(reply).is_err() {
             break;
         }
+        wake.notify();
     }
 }
 

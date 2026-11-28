@@ -160,7 +160,8 @@ impl ShmDoublePool {
         let frame_bytes = (self.width as usize) * (self.height as usize) * 4;
         let offset = idx * frame_bytes;
         // SAFETY: `map_ptr` points to `2 * frame_bytes` valid mapped bytes for the lifetime of `Self`.
-        let slice = unsafe { std::slice::from_raw_parts_mut(self.map_ptr.add(offset), frame_bytes) };
+        let slice =
+            unsafe { std::slice::from_raw_parts_mut(self.map_ptr.add(offset), frame_bytes) };
         (idx, &self.slots[idx].buffer, slice)
     }
 }
@@ -297,7 +298,10 @@ pub fn run_wayland_shm(
             break;
         }
     }
-    ensure!(state.configured, "Wayland xdg_surface 未完成初始 Configure 握手");
+    ensure!(
+        state.configured,
+        "Wayland xdg_surface 未完成初始 Configure 握手"
+    );
 
     let mut renderer = WgpuSpatialRenderer::new_headless()
         .context("初始化 Vulkan 空间渲染器 (WgpuSpatialRenderer) 失败")?;
@@ -314,8 +318,11 @@ pub fn run_wayland_shm(
         .filter(|&s| s > 0)
         .map(|s| Instant::now() + Duration::from_secs(s));
 
-    // Render initial frames so async thumbnails upload cleanly and surface maps immediately in `xr-wayland`!
-    let mut warmup_frames = 10u32;
+    let preview_fd = app.previewer.wake.enable()?;
+    let control_fd = control
+        .map(|ctl| ctl.wake.enable())
+        .transpose()?
+        .unwrap_or(-1);
 
     while !state.closed && !app.shutdown_requested() {
         if deadline.is_some_and(|dl| Instant::now() >= dl) {
@@ -323,46 +330,56 @@ pub fn run_wayland_shm(
         }
 
         if let Some(ctl) = control {
-            let prev_loc = app.current_location.clone();
-            let prev_view = app.view_mode;
-            let prev_q = app.search_query.clone();
-            let prev_undo = app.undo_stack.len();
-            ctl.poll_and_apply(app);
-            if app.current_location != prev_loc
-                || app.view_mode != prev_view
-                || app.search_query != prev_q
-                || app.undo_stack.len() != prev_undo
-            {
-                state.needs_redraw = true;
-            }
+            state.needs_redraw |= ctl.poll_and_apply(app);
         }
         if app.shutdown_requested() {
             break;
         }
 
-        // Non-blocking dispatch of incoming Wayland events
+        // Wait for input, worker completion or the duration limit while the window is still.
         conn.flush()?;
         if let Some(guard) = conn.prepare_read() {
-            let poll_ms = if state.needs_redraw || warmup_frames > 0 || app.has_active_animation() {
+            let poll_ms = if state.needs_redraw || app.has_active_animation() {
                 0
             } else {
-                16
+                deadline.map_or(-1, |dl| {
+                    dl.saturating_duration_since(Instant::now())
+                        .as_millis()
+                        .min(i32::MAX as u128) as i32
+                })
             };
-            let mut pfd = libc::pollfd {
-                fd: guard.connection_fd().as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let ready = unsafe { libc::poll(&mut pfd, 1, poll_ms) };
-            if ready > 0 && (pfd.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP)) != 0 {
-                let _ = guard.read();
-            } else {
-                drop(guard);
+            let mut fds = [guard.connection_fd().as_raw_fd(), preview_fd, control_fd].map(|fd| {
+                libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                }
+            });
+            let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, poll_ms) };
+            if ready < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error.into());
+            }
+            if fds[0].revents != 0 {
+                guard.read()?;
+            }
+            if fds[1].revents != 0 {
+                app.previewer.wake.drain();
+                state.needs_redraw = true;
+            }
+            if fds[2].revents != 0 {
+                if let Some(ctl) = control {
+                    ctl.wake.drain();
+                    state.needs_redraw |= ctl.poll_and_apply(app);
+                }
             }
         }
         event_queue.dispatch_pending(&mut state)?;
 
-        if state.closed {
+        if state.closed || app.shutdown_requested() {
             break;
         }
 
@@ -390,7 +407,7 @@ pub fn run_wayland_shm(
             state.needs_redraw = true;
         }
 
-        if state.needs_redraw || warmup_frames > 0 || app.has_active_animation() {
+        if state.needs_redraw || app.has_active_animation() {
             let w = state.target_width;
             let h = state.target_height;
             let eye = SpatialFilesApp::embedded_eye(w, h);
@@ -446,10 +463,7 @@ pub fn run_wayland_shm(
 
             app.submitted_frames += 1;
             state.needs_redraw = false;
-            if warmup_frames > 0 {
-                warmup_frames -= 1;
-                std::thread::sleep(Duration::from_millis(16));
-            } else if app.has_active_animation() {
+            if app.has_active_animation() {
                 std::thread::sleep(Duration::from_millis(16));
             }
         }
@@ -501,8 +515,8 @@ fn apply_evdev_key(app: &mut SpatialFilesApp, key: u32, ctrl: bool, shift: bool)
     }
 
     match key {
-        1 => app.cancel_modals(),           // KEY_ESC
-        14 => app.handle_backspace(),       // KEY_BACKSPACE
+        1 => app.cancel_modals(),     // KEY_ESC
+        14 => app.handle_backspace(), // KEY_BACKSPACE
         15 => {
             let next = match app.view_mode {
                 ViewMode::Workbench => ViewMode::Treemap3D,
@@ -510,15 +524,15 @@ fn apply_evdev_key(app: &mut SpatialFilesApp, key: u32, ctrl: bool, shift: bool)
             };
             app.set_view_mode(next);
         } // KEY_TAB
-        28 | 96 => app.commit_prompt(),     // KEY_ENTER / KPENTER
+        28 | 96 => app.commit_prompt(), // KEY_ENTER / KPENTER
         60 => {
             if let Some(idx) = app.primary_selected {
                 app.prompt_mode = Some(PromptMode::Rename);
                 app.prompt_buffer = app.all_entries[idx].name.clone();
             }
         } // KEY_F2
-        104 => app.step_page(-1),           // KEY_PAGEUP
-        109 => app.step_page(1),            // KEY_PAGEDOWN
+        104 => app.step_page(-1),     // KEY_PAGEUP
+        109 => app.step_page(1),      // KEY_PAGEDOWN
         111 => {
             let _ = app.trash_or_restore_selected();
         } // KEY_DELETE

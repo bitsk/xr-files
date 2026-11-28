@@ -9,6 +9,7 @@ pub mod simd;
 pub mod spatial;
 pub mod text;
 pub mod treemap3d;
+mod wake;
 pub mod wayland_shm;
 pub mod window_mode;
 pub mod xr_input;

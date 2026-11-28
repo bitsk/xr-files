@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 pub mod app;
 pub mod control;
+mod desktop_feedback;
 pub mod fs_ops;
 pub mod icons;
 pub mod preview;

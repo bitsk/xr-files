@@ -54,6 +54,7 @@ struct WindowRunner<'a> {
     cam_yaw: f32,
     cam_pitch: f32,
     modifiers: ModifiersState,
+    feedback: crate::desktop_feedback::DesktopFeedback,
 }
 
 impl<'a> WindowRunner<'a> {
@@ -73,6 +74,7 @@ impl<'a> WindowRunner<'a> {
             cam_yaw: 0.0,
             cam_pitch: -0.03,
             modifiers: ModifiersState::empty(),
+            feedback: crate::desktop_feedback::DesktopFeedback::connect(),
         }
     }
 
@@ -199,7 +201,7 @@ impl<'a> WindowRunner<'a> {
         let scene = self
             .app
             .step_and_build_scene(&eyes, &hands, &mut gpu.glyphs);
-        let _ = self.app.take_haptics();
+        self.feedback.emit(self.app.take_haptics());
 
         gpu.renderer.sync_textures(
             &mut gpu.glyphs,

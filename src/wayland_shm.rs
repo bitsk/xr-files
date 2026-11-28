@@ -318,6 +318,7 @@ pub fn run_wayland_shm(
         .filter(|&s| s > 0)
         .map(|s| Instant::now() + Duration::from_secs(s));
 
+    let feedback = crate::desktop_feedback::DesktopFeedback::connect();
     let preview_fd = app.previewer.wake.enable()?;
     let control_fd = control
         .map(|ctl| ctl.wake.enable())
@@ -443,7 +444,7 @@ pub fn run_wayland_shm(
             let hands = [hand0, HandControllerInput::default()];
             let eyes = [eye, eye];
             let scene = app.step_and_build_scene(&eyes, &hands, &mut glyphs);
-            let _ = app.take_haptics();
+            feedback.emit(app.take_haptics());
 
             renderer.sync_textures(
                 &mut glyphs,
